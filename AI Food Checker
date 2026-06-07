@@ -1,0 +1,90 @@
+import torch
+import open_clip
+import csv
+import numpy as np
+from PIL import Image
+import os
+
+# 1. OPTIMIZE FOR INTEL i7 CPU
+# This forces PyTorch to use your physical CPU cores properly
+torch.set_num_threads(4) 
+
+SAVE_PATH = r"C:\Users\arnav\OneDrive\Desktop\app\query_vector.npy"
+
+device = "cpu" # Enforced for CPU timing
+print("Loading model weights (approx. 350MB)...")
+model, _, preprocess = open_clip.create_model_and_transforms("ViT-B-32", pretrained="laion2b_s34b_b79k")
+model = model.to(device)
+model.eval()
+tokenizer = open_clip.get_tokenizer("ViT-B-32")
+print("Model loaded.")
+
+# 2. BATCHED PROCESSING FUNCTION
+@torch.no_grad()
+def get_text_embeddings_in_batches(texts, batch_size=32):
+    all_embeddings = []
+    total = len(texts)
+    
+    for i in range(0, total, batch_size):
+        batch = texts[i:i + batch_size]
+        tokens = tokenizer(batch).to(device)
+        embeddings = model.encode_text(tokens)
+        embeddings = embeddings / embeddings.norm(dim=-1, keepdim=True)
+        all_embeddings.append(embeddings.numpy())
+        
+        # Simple print statement to track progress without extra libraries
+        print(f"Processed {min(i + batch_size, total)}/{total} rows...", end="\r")
+        
+    return np.vstack(all_embeddings)
+
+# 3. RUN
+descriptions = []
+path = r"C:\Users\arnav\OneDrive\Desktop\app\food.csv"
+
+with open(path, "r", encoding="utf-8") as file:
+    reader = csv.DictReader(file)
+    for row in reader:
+        descriptions.append(row['description'])
+
+if descriptions:
+    print(f"Starting embedding generation for {len(descriptions)} items...")
+    if os.path.exists(SAVE_PATH):
+        print("Loading existing vector matrix from 'query_vector.npy'...")
+        vectors = np.load(SAVE_PATH)
+    else:
+        print('ok ur cooked')
+        vectors = get_text_embeddings_in_batches(descriptions, batch_size=32)
+    print(f"\nFinished! Vector Matrix Shape: {vectors.shape}")
+
+image_path = r"C:\Users\arnav\OneDrive\Desktop\app\IMG_3771.jpeg"
+
+try:
+    raw_image = Image.open(image_path).convert("RGB")
+    
+    # unsqueeze(0) adds a batch dimension, making the shape [1, 3, 224, 224]
+    processed_image = preprocess(raw_image).unsqueeze(0).to(device)
+
+    # 3. Generate and normalize the image embedding
+    with torch.no_grad():
+        new_vector = model.encode_image(processed_image)
+        new_vector = new_vector / new_vector.norm(dim=-1, keepdim=True)
+        new_vector = new_vector.numpy()
+except:
+    print("didnt work")
+    exit()
+
+save_path = r"C:\Users\arnav\OneDrive\Desktop\app\query_vector.npy"
+np.save(save_path, vectors)
+print(f"Successfully saved image embedding to: {save_path}")
+
+
+similarity_scores = np.dot(new_vector, vectors.T).reshape(-1)
+
+best_match_index = np.argmax(similarity_scores)
+highest_score = similarity_scores[best_match_index]
+
+# Print the result
+print(f"--- Search Result ---")
+#print(f"Query: 'lemon'")
+print(f"Closest Match in CSV: {descriptions[best_match_index]}")
+print(f"Confidence Score: {highest_score:.4f} (closer to 1.0 means a tighter match)")
