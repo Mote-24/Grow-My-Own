@@ -88,3 +88,37 @@ print(f"--- Search Result ---")
 #print(f"Query: 'lemon'")
 print(f"Closest Match in CSV: {descriptions[best_match_index]}")
 print(f"Confidence Score: {highest_score:.4f} (closer to 1.0 means a tighter match)")
+
+target = descriptions[best_match_index]
+
+with open (path, "r", encoding="utf-8") as file:
+    reader = csv.DictReader(file)
+    for row in reader:
+        if row['description'] == target:
+            fdc_id = row['fdc_id']
+
+path2 = r"C:\Users\arnav\OneDrive\Desktop\app\food_nutrient.csv"
+nutrient_id_list = []
+amount_list = []
+
+with open(path2, "r", encoding="utf-8") as file:
+    reader = csv.DictReader(file)
+    for row in reader:
+        if row['fdc_id'] == fdc_id:
+            nutrient_id_list.append(row['nutrient_id'])
+            amount_list.append(row['amount'])
+
+path3 = r"C:\Users\arnav\OneDrive\Desktop\app\nutrient.csv"
+nutrient_name_list = []
+
+with open(path3, "r", encoding="utf-8") as file:
+    reader = csv.DictReader(file)
+    for row in reader:
+        if row['nutrient_nbr'] in nutrient_id_list:
+            nutrient_name_list.append(row['name'])
+
+with open(r"C:\Users\arnav\OneDrive\Desktop\app\analyze.csv", 'w', encoding='utf-8', newline='') as file:
+    writer = csv.writer(file)
+    writer.writerow(['Nutrient Name', 'Amount'])
+    for name, amount in zip(nutrient_name_list, amount_list):
+        writer.writerow([name, amount])
