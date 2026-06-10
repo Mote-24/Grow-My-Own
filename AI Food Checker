@@ -4,6 +4,9 @@ import csv
 import numpy as np
 from PIL import Image
 import os
+from google import genai
+import re
+import streamlit as st
 
 # 1. OPTIMIZE FOR INTEL i7 CPU
 # This forces PyTorch to use your physical CPU cores properly
@@ -56,7 +59,7 @@ if descriptions:
         vectors = get_text_embeddings_in_batches(descriptions, batch_size=32)
     print(f"\nFinished! Vector Matrix Shape: {vectors.shape}")
 
-image_path = r"C:\Users\arnav\OneDrive\Desktop\app\IMG_3771.jpeg"
+image_path = r"C:\Users\arnav\OneDrive\Desktop\app\IMG_3770.jpeg"
 
 try:
     raw_image = Image.open(image_path).convert("RGB")
@@ -122,3 +125,30 @@ with open(r"C:\Users\arnav\OneDrive\Desktop\app\analyze.csv", 'w', encoding='utf
     writer.writerow(['Nutrient Name', 'Amount'])
     for name, amount in zip(nutrient_name_list, amount_list):
         writer.writerow([name, amount])
+
+client = genai.Client()
+try:
+    response = client.models.generate_content(
+        model='gemini-2.5-flash-lite',
+        contents='Generate some possible, realistic meal portion sizes for the following food item: ' + target + '.\n' + 'Please provide the portion size in grams, with a very short verbal description (around 5-10 words) for user-friendliness. Please output in this format: 1. [portion size] [unit]: [description], 2. [portion size] [unit]: [description], 3. [portion size] [unit]: [description]. Each numerical point should get another line, and output as a Python list. \n\n'
+        
+    )
+except genai.errors.ServerError:
+    print("Error occurred while generating content. Please try again.")
+    exit()
+
+
+matches = re.findall(r'(\d+)\s*g', response.text, re.IGNORECASE)
+
+if len(matches) < 3:
+    print("Could not extract 3 portion sizes.")
+    exit()
+
+portion_sizes = [int(x) for x in matches[:3]]
+
+print(portion_sizes[0])
+print(portion_sizes[1])
+print(portion_sizes[2])
+
+x = int(input("Enter the number of the portion size you want to select (1, 2, or 3): "))
+portion_amount = portion_sizes[x - 1]
