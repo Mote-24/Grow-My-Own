@@ -1,0 +1,141 @@
+# ── Goal ratios (nutrient amount, per X calories) ──────────────────────────
+goalFiberRatio    = (1.4,  100)   # g fiber per 100 cal
+goalCarbRatio     = (15,   100)   # g carbs per 100 cal
+goalCRatio        = (0.9,  100)   # mg vitamin C per 100 cal
+goalARatio        = (75,   100)   # mcg vitamin A per 100 cal  (RDA ~900 mcg/day ÷ ~1200 cal)
+goalBRatio        = (0.1,  100)   # mg vitamin B (B1) per 100 cal
+goalERatio        = (1.25, 100)   # mg vitamin E per 100 cal
+goalIronRatio     = (1.2,  100)   # mg iron per 100 cal
+goalMagRatio      = (14,   100)   # mg magnesium per 100 cal
+goalPotRatio      = (280,  100)   # mg potassium per 100 cal
+goalSeleniumRatio = (4.7,  100)   # mcg selenium per 100 cal
+
+# ── Fiber (g per serving calories) ─────────────────────────────────────────
+appleFiberRatio  = (4, 95)
+orangeFiberRatio = (1, 23)
+lemonFiberRatio  = (2, 20)
+foodFiberRatios  = [appleFiberRatio, orangeFiberRatio, lemonFiberRatio]
+
+# ── Carbs (g per serving calories) ─────────────────────────────────────────
+appleCarbRatio  = (27, 100)
+orangeCarbRatio = (25, 100)
+lemonCarbRatio  = (32, 100)
+foodCarbRatios  = [appleCarbRatio, orangeCarbRatio, lemonCarbRatio]
+
+# ── Vitamin C (mg per serving calories) ────────────────────────────────────
+appleCRatio  = (8/100,  100)
+orangeCRatio = (70/100, 100)
+lemonCRatio  = (50/100, 100)
+foodCRatios  = [appleCRatio, orangeCRatio, lemonCRatio]
+
+# ── Vitamin A (mcg per serving calories) ───────────────────────────────────
+appleARatio  = (3/95,   100)
+orangeARatio = (14/47,  100)
+lemonARatio  = (1/29,   100)
+foodARatios  = [appleARatio, orangeARatio, lemonARatio]
+
+# ── Vitamin B / B1 Thiamine (mg per serving calories) ──────────────────────
+appleB1Ratio  = (0.031/95,  100)
+orangeB1Ratio = (0.114/47,  100)
+lemonB1Ratio  = (0.034/29,  100)
+foodBRatios   = [appleB1Ratio, orangeB1Ratio, lemonB1Ratio]
+
+# ── Vitamin E (mg per serving calories) ────────────────────────────────────
+appleERatio  = (0.18/95, 100)
+orangeERatio = (0.18/47, 100)
+lemonERatio  = (0.15/29, 100)
+foodERatios  = [appleERatio, orangeERatio, lemonERatio]
+
+# ── Iron (mg per serving calories) ─────────────────────────────────────────
+appleIronRatio  = (0.12/95, 100)
+orangeIronRatio = (0.10/47, 100)
+lemonIronRatio  = (0.60/29, 100)
+foodIronRatios  = [appleIronRatio, orangeIronRatio, lemonIronRatio]
+
+# ── Magnesium (mg per serving calories) ────────────────────────────────────
+appleMagRatio  = (5/95,  100)
+orangeMagRatio = (10/47, 100)
+lemonMagRatio  = (6/29,  100)
+foodMagRatios  = [appleMagRatio, orangeMagRatio, lemonMagRatio]
+
+# ── Potassium (mg per serving calories) ────────────────────────────────────
+applePotRatio  = (107/95,  100)
+orangePotRatio = (181/47,  100)
+lemonPotRatio  = (80/29,   100)
+foodPotRatios  = [applePotRatio, orangePotRatio, lemonPotRatio]
+
+# ── Selenium (mcg per serving calories) ────────────────────────────────────
+appleSeleniumRatio  = (0/95,    100)   # apples have negligible selenium
+orangeSeleniumRatio = (0.5/47,  100)
+lemonSeleniumRatio  = (0.3/29,  100)
+foodSeleniumRatios  = [appleSeleniumRatio, orangeSeleniumRatio, lemonSeleniumRatio]
+
+# ── Nutrient weights (must sum to 100) ─────────────────────────────────────
+weights = {
+    "fiber":     20,
+    "carb":      10,
+    "vitaminC":  10,
+    "vitaminA":  10,
+    "vitaminB":  10,
+    "vitaminE":  10,
+    "iron":      10,
+    "magnesium": 10,
+    "potassium": 5,
+    "selenium":  5,
+}
+
+# ── Core functions ──────────────────────────────────────────────────────────
+def returnEfficiency(goalRatio, foodRatio):
+    """Compare a food's nutrient ratio to the goal ratio, both normalized to per-100-cal."""
+    normFactor  = 100 / foodRatio[1]
+    foodNormed  = round(foodRatio[0] * normFactor, 4)
+    goalNormed  = goalRatio[0] * (100 / goalRatio[1])
+    return foodNormed / goalNormed if goalNormed != 0 else 0
+
+def scoreNutrientList(foodRatios, goalRatio):
+    """Run returnEfficiency across a list of foods for one nutrient."""
+    return [returnEfficiency(goalRatio, food) for food in foodRatios]
+
+def returnWeightedScore(nutrientScoreLists, weights):
+    """
+    nutrientScoreLists: dict of {name: [score_food1, score_food2, ...]}
+    weights:            dict of {name: weight_value}
+    Returns the weighted average score across all foods and nutrients.
+    """
+    totalWeight = sum(weights.values())
+    numFoods    = len(next(iter(nutrientScoreLists.values())))
+    foodScores  = []
+
+    for foodIdx in range(numFoods):
+        weightedSum = 0
+        for nutrient, scores in nutrientScoreLists.items():
+            weightedSum += scores[foodIdx] * weights[nutrient]
+        foodScores.append(weightedSum / totalWeight)
+
+    return sum(foodScores) / numFoods
+
+# ── Score every nutrient list ───────────────────────────────────────────────
+nutrientScoreLists = {
+    "fiber":     scoreNutrientList(foodFiberRatios,     goalFiberRatio),
+    "carb":      scoreNutrientList(foodCarbRatios,      goalCarbRatio),
+    "vitaminC":  scoreNutrientList(foodCRatios,         goalCRatio),
+    "vitaminA":  scoreNutrientList(foodARatios,         goalARatio),
+    "vitaminB":  scoreNutrientList(foodBRatios,         goalBRatio),
+    "vitaminE":  scoreNutrientList(foodERatios,         goalERatio),
+    "iron":      scoreNutrientList(foodIronRatios,      goalIronRatio),
+    "magnesium": scoreNutrientList(foodMagRatios,       goalMagRatio),
+    "potassium": scoreNutrientList(foodPotRatios,       goalPotRatio),
+    "selenium":  scoreNutrientList(foodSeleniumRatios,  goalSeleniumRatio),
+}
+
+# ── Print per-nutrient breakdown then final score ───────────────────────────
+foods = ["Apple", "Orange", "Lemon"]
+print("── Per-nutrient efficiency scores ──")
+for nutrient, scores in nutrientScoreLists.items():
+    print(f"  {nutrient:<12}", end="")
+    for food, score in zip(foods, scores):
+        print(f"  {food}: {score:.3f}", end="")
+    print()
+
+finalScore = returnWeightedScore(nutrientScoreLists, weights)
+print(f"\nFinal weighted score: {finalScore:.4f}")
