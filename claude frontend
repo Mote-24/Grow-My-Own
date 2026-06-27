@@ -1,0 +1,1327 @@
+"""
+Bloom — Healthy Habits App  (rewritten Flet framework)
+======================================================
+
+Key improvements in this version
+--------------------------------
+1. Every food lookup and photo analysis runs in a BACKGROUND THREAD with a
+   modal LOADING screen, so the UI never freezes. The loading screen for a
+   typed food stays up until the nutrition tab has actually been updated.
+2. Photo upload shows its own loading screen, then asks the user to CONFIRM
+   the matched food. If they say it's wrong, they're prompted to type the
+   correct food name, which is then logged like a normal entry.
+3. The CLIP model + text-embedding matrix are loaded ONCE and cached
+   (in-memory + on disk), instead of being rebuilt on every photo.
+4. All hard-coded Windows paths are gone — CSVs / checkpoints are resolved
+   relative to this file (BASE_DIR), so the app is portable.
+5. Heavy ML deps (torch / open_clip / cv2 / numpy / PIL / SAM / Depth) are
+   imported lazily and wrapped in guards, so the app still runs (and the
+   typed-food path still works) even if the vision stack isn't installed.
+
+Expected files next to this script (BASE_DIR):
+    food.csv           (columns: fdc_id, description)
+    food_nutrient.csv  (columns: fdc_id, nutrient_id, amount)
+    nutrient.csv       (columns: nutrient_nbr, name)         # optional
+    checkpoints/sam2_hiera_small.pt                          # optional
+    checkpoints/depth_anything_v2_vits.pth                   # optional
+
+Install / run:
+    pip install flet
+    # optional, for photo analysis:
+    pip install torch open_clip_torch opencv-python pillow numpy
+    export ANTHROPIC_API_KEY="sk-ant-..."
+    python bloom_app.py
+"""
+
+import os
+import csv
+import json
+import threading
+import urllib.request
+from collections import defaultdict
+
+import flet as ft
+
+# ─────────────────────────────────────────────
+# THEME / PALETTE
+# ─────────────────────────────────────────────
+SAGE      = "#7BAE7F"
+FOREST    = "#2D4A2E"
+FOREST_LT = "#3B6D11"
+LEAF_BG   = "#EAF3DE"
+LEAF_MID  = "#C0DD97"
+CREAM     = "#FEFAE0"
+CLAY      = "#C17B5A"
+AMBER     = "#EF9F27"
+AMBER_LT  = "#FAEEDA"
+BLUE      = "#378ADD"
+CORAL     = "#D85A30"
+GRAY_LT   = "#F1EFE8"
+WHITE     = "#FFFFFF"
+TEXT_PRI  = "#1A1A1A"
+TEXT_SEC  = "#666660"
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# Cap how many descriptions get loaded into the autocomplete so the UI stays
+# snappy even with a very large food.csv. Raise/lower to taste.
+MAX_AUTOCOMPLETE_SUGGESTIONS = 4000
+
+# USDA nutrient_id  ->  our internal nutrient key.
+# Both mono (645) and poly (646) fats fold into "unsat_fat".
+NUTRIENT_MAP = {
+    "301": "calcium",
+    "303": "iron",
+    "291": "total_fiber",
+    "203": "protein",
+    "645": "unsat_fat",
+    "646": "unsat_fat",
+    "320": "vit_a",
+    "401": "vit_c",
+    "328": "vit_d",
+    "323": "vit_e",
+}
+
+# Rough daily targets used to fill the progress bars (not medical advice).
+DAILY_TARGETS = {
+    "calcium": 1300, "iron": 18, "total_fiber": 28,
+    "protein": 50,   "unsat_fat": 44,
+    "vit_a": 900,    "vit_c": 90, "vit_d": 20, "vit_e": 15,
+}
+
+NUTRIENT_KEYS = ["calcium", "iron", "total_fiber", "protein", "unsat_fat",
+                 "vit_a", "vit_c", "vit_d", "vit_e"]
+
+
+# ─────────────────────────────────────────────
+# NUTRITION DATA LAYER  (CSV lookups, cached)
+# ─────────────────────────────────────────────
+class NutritionDB:
+    """Resolves food descriptions -> fdc_id -> nutrient amounts (per 100 g)."""
+
+    def __init__(self, base_dir=BASE_DIR):
+        self.food_csv          = os.path.join(base_dir, "food.csv")
+        self.food_nutrient_csv = os.path.join(base_dir, "food_nutrient.csv")
+        self._descriptions = None   # list[str]
+        self._desc_to_fdc  = None   # dict[str, str]
+
+    # ---- food index (description <-> fdc_id) ----
+    def load_food_index(self):
+        if self._desc_to_fdc is not None:
+            return
+        descriptions, desc_to_fdc = [], {}
+        try:
+            with open(self.food_csv, "r", encoding="utf-8", newline="") as f:
+                for row in csv.DictReader(f):
+                    d = (row.get("description") or "").strip()
+                    fdc = (row.get("fdc_id") or "").strip()
+                    if d and fdc and d not in desc_to_fdc:
+                        descriptions.append(d)
+                        desc_to_fdc[d] = fdc
+        except FileNotFoundError:
+            print(f"[NutritionDB] food.csv not found at {self.food_csv}")
+        self._descriptions = descriptions
+        self._desc_to_fdc  = desc_to_fdc
+
+    def descriptions(self):
+        self.load_food_index()
+        return self._descriptions
+
+    def fdc_for(self, description):
+        self.load_food_index()
+        return self._desc_to_fdc.get(description.strip())
+
+    def find_match(self, text):
+        """Return (description, fdc_id). Exact match first, then 'contains'."""
+        self.load_food_index()
+        t = text.strip()
+        fdc = self._desc_to_fdc.get(t)
+        if fdc:
+            return t, fdc
+        tl = t.lower()
+        for d in self._descriptions:
+            if tl in d.lower():
+                return d, self._desc_to_fdc[d]
+        return None, None
+
+    # ---- nutrient amounts for a given food (per 100 g) ----
+    def nutrients_for_fdc(self, fdc_id):
+        totals = defaultdict(float)
+        if not fdc_id:
+            return totals
+        try:
+            with open(self.food_nutrient_csv, "r", encoding="utf-8", newline="") as f:
+                for row in csv.DictReader(f):
+                    if row.get("fdc_id") != fdc_id:
+                        continue
+                    key = NUTRIENT_MAP.get(row.get("nutrient_id"))
+                    if not key:
+                        continue
+                    try:
+                        totals[key] += float(row.get("amount") or 0)
+                    except ValueError:
+                        pass
+        except FileNotFoundError:
+            print(f"[NutritionDB] food_nutrient.csv not found at {self.food_nutrient_csv}")
+        return totals
+
+
+db = NutritionDB(BASE_DIR)
+
+
+# ─────────────────────────────────────────────
+# FOOD VISION MODEL  (CLIP match + optional mass)
+#   Loaded once, reused for every photo.
+# ─────────────────────────────────────────────
+class FoodVisionModel:
+    TEXT_VECTOR_CACHE = os.path.join(BASE_DIR, "text_vectors.npy")
+
+    def __init__(self, nutrition_db):
+        self.db = nutrition_db
+        self.model = None
+        self.preprocess = None
+        self.tokenizer = None
+        self.text_vectors = None  # np.ndarray aligned with db.descriptions()
+
+    # ---- lazy, one-time load ----
+    def _ensure_loaded(self):
+        if self.model is not None:
+            return
+        import torch
+        import open_clip
+
+        torch.set_num_threads(max(1, (os.cpu_count() or 4) // 2))
+        model, _, preprocess = open_clip.create_model_and_transforms(
+            "ViT-B-32", pretrained="laion2b_s34b_b79k"
+        )
+        model.eval()
+        self.model = model
+        self.preprocess = preprocess
+        self.tokenizer = open_clip.get_tokenizer("ViT-B-32")
+        self._load_or_build_text_vectors()
+
+    def _embed_texts(self, texts, batch_size=64):
+        import torch
+        import numpy as np
+        out = []
+        with torch.no_grad():
+            for i in range(0, len(texts), batch_size):
+                tokens = self.tokenizer(texts[i:i + batch_size])
+                emb = self.model.encode_text(tokens)
+                emb = emb / emb.norm(dim=-1, keepdim=True)
+                out.append(emb.cpu().numpy())
+                print(f"  embedding text {min(i + batch_size, len(texts))}/{len(texts)}", end="\r")
+        print()
+        return np.vstack(out)
+
+    def _load_or_build_text_vectors(self):
+        import numpy as np
+        descs = self.db.descriptions()
+        if not descs:
+            self.text_vectors = np.empty((0, 512), dtype="float32")
+            return
+        if os.path.exists(self.TEXT_VECTOR_CACHE):
+            cached = np.load(self.TEXT_VECTOR_CACHE)
+            if cached.shape[0] == len(descs):
+                self.text_vectors = cached
+                return
+        print(f"[Vision] Building text embeddings for {len(descs)} foods (one-time)...")
+        vecs = self._embed_texts(descs)
+        try:
+            np.save(self.TEXT_VECTOR_CACHE, vecs)
+        except Exception as e:
+            print(f"[Vision] couldn't cache text vectors: {e}")
+        self.text_vectors = vecs
+
+    # ---- main entry point ----
+    def identify(self, image_path):
+        """Return dict: ok, description, fdc_id, confidence (0-1), mass (g), error."""
+        result = {"ok": False, "description": None, "fdc_id": None,
+                  "confidence": 0.0, "mass": 100.0, "error": None}
+        try:
+            import numpy as np
+            import torch
+            from PIL import Image
+
+            self._ensure_loaded()
+            descs = self.db.descriptions()
+            if not descs or self.text_vectors is None or self.text_vectors.shape[0] == 0:
+                result["error"] = "Food database is empty."
+                return result
+
+            image = Image.open(image_path).convert("RGB")
+            with torch.no_grad():
+                img_t = self.preprocess(image).unsqueeze(0)
+                img_vec = self.model.encode_image(img_t)
+                img_vec = img_vec / img_vec.norm(dim=-1, keepdim=True)
+                img_vec = img_vec.cpu().numpy()
+
+            sims = np.dot(img_vec, self.text_vectors.T).reshape(-1)
+            best = int(np.argmax(sims))
+            description = descs[best]
+
+            result["ok"] = True
+            result["description"] = description
+            result["confidence"] = float(sims[best])
+            result["fdc_id"] = self.db.fdc_for(description)
+            result["mass"] = self._estimate_mass(image_path)  # graceful fallback inside
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            result["error"] = str(e)
+        return result
+
+    # ---- optional geometric mass estimate (defaults to 100 g) ----
+    def _estimate_mass(self, image_path, default_g=100.0):
+        """Best-effort SAM + depth volume estimate. Any failure -> default_g."""
+        try:
+            import numpy as np
+            import cv2
+            import torch
+            from PIL import Image
+            from sam2.build_sam import build_sam2
+            from sam2.sam2_image_predictor import SAM2ImagePredictor
+            from depth_anything_v2.dpt import DepthAnythingV2
+
+            sam_ckpt = os.path.join(BASE_DIR, "checkpoints", "sam2_hiera_small.pt")
+            depth_ckpt = os.path.join(BASE_DIR, "checkpoints", "depth_anything_v2_vits.pth")
+            if not (os.path.exists(sam_ckpt) and os.path.exists(depth_ckpt)):
+                return default_g
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+            # --- segmentation: central object mask ---
+            sam = build_sam2("configs/sam2/sam2_hiera_s", sam_ckpt,
+                             device=device, apply_postprocessing=False)
+            predictor = SAM2ImagePredictor(sam)
+            image = np.array(Image.open(image_path).convert("RGB"))
+            predictor.set_image(image)
+            h, w, _ = image.shape
+            masks, scores, _ = predictor.predict(
+                point_coords=np.array([[w // 2, h // 2]]),
+                point_labels=np.array([1]),
+                multimask_output=True,
+            )
+            mask = masks[int(np.argmax(scores))].astype(np.uint8)
+            k = np.ones((5, 5), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k).astype(bool)
+
+            # --- depth ---
+            depth_model = DepthAnythingV2(encoder="vits", features=64,
+                                          out_channels=[48, 96, 192, 384])
+            depth_model.load_state_dict(torch.load(depth_ckpt, map_location=device))
+            depth_model.to(device).eval()
+            depth = depth_model.infer_image(cv2.imread(image_path)).astype(np.float32)
+            depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+
+            # --- volume -> mass ---
+            depth = cv2.resize(depth, (mask.shape[1], mask.shape[0]))
+            boundary = cv2.dilate(mask.astype(np.uint8), np.ones((7, 7))) - mask.astype(np.uint8)
+            vals = depth[boundary == 1]
+            plate = np.median(vals) if len(vals) > 10 else np.median(depth)
+            height = np.clip(plate - depth, 0, None) * mask
+            pixel_to_cm = 0.05
+            volume_cm3 = float(np.sum(height * (pixel_to_cm ** 2)))
+            mass = volume_cm3 * 1.05  # rough density
+            return mass if mass > 1 else default_g
+        except Exception:
+            return default_g
+
+
+_vision = {"model": None}
+
+
+def get_vision_model():
+    if _vision["model"] is None:
+        _vision["model"] = FoodVisionModel(db)
+    return _vision["model"]
+
+
+# ─────────────────────────────────────────────
+# APP STATE
+# ─────────────────────────────────────────────
+class AppState:
+    def __init__(self):
+        self.diet      = "omnivore"
+        self.goal      = "less_processed"
+        self.location  = "us"
+        self.gender    = "Male"
+        self.age       = "18"
+        self.allergies = []
+        self.produce   = ["apple", "kale", "blueberries"]
+        self.yn_state  = {}     # {index: "yes"|"no"}
+        self.plant_level = 1
+        self.serving   = 1.0
+        self.BASE = {k: 0.0 for k in NUTRIENT_KEYS}
+
+    def compute_plant_level(self):
+        yes_count = sum(1 for v in self.yn_state.values() if v == "yes")
+        produce_bonus = min(len(self.produce), 4)
+        self.plant_level = min(6, 1 + yes_count + produce_bonus // 2)
+
+    def overall_score(self):
+        yes_count = sum(1 for v in self.yn_state.values() if v == "yes")
+        return min(100, 55 + yes_count * 8 + min(len(self.produce), 4) * 4)
+
+    def nutrition(self):
+        s = self.serving
+        return {k: round(v * s, 1) for k, v in self.BASE.items()}
+
+    def apply_nutrients(self, nutrients, scale=1.0):
+        for k, v in nutrients.items():
+            if k in self.BASE:
+                self.BASE[k] += v * scale
+
+    def reset_day(self):
+        self.BASE = {k: 0.0 for k in NUTRIENT_KEYS}
+        self.yn_state = {}
+
+
+state = AppState()
+
+
+# ─────────────────────────────────────────────
+# ANTHROPIC API (direct, no SDK)
+# ─────────────────────────────────────────────
+def claude(prompt: str, max_tokens: int = 400) -> str:
+    body = json.dumps({
+        "model": "claude-sonnet-4-6",
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": API_KEY,
+            "anthropic-version": "2023-06-01",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+    return data["content"][0]["text"].strip()
+
+
+def fetch_daily_goal(callback):
+    prompt = (
+        "Give one small, doable daily milestone for someone trying to eat more "
+        f"whole, less-processed food (diet: {state.diet}). One friendly sentence, "
+        "realistic and encouraging, like 'prep apple slices before bed.' No health claims."
+    )
+    try:
+        callback(claude(prompt, max_tokens=120))
+    except Exception:
+        callback("Slice some fruit and leave it somewhere visible today — easy access makes all the difference!")
+
+
+def fetch_meal_ideas(fruit, callback):
+    produce_str   = ", ".join(state.produce) or fruit
+    allergies_str = ", ".join(state.allergies) or "none"
+    prompt = (
+        f"Suggest 3 cheap, easy meal ideas featuring {fruit} and any of: {produce_str}. "
+        f"Diet: {state.diet}. Cuisine preference: {state.location}. Avoid: {allergies_str}. "
+        "Friendly and practical, no health claims. Short numbered list: bold name + 1 sentence."
+    )
+    try:
+        callback(claude(prompt, max_tokens=400))
+    except Exception:
+        callback("Couldn't load ideas right now — check your API key and try again!")
+
+
+# ─────────────────────────────────────────────
+# SMALL UI HELPERS
+# ─────────────────────────────────────────────
+def thin_border(color="#DDDDDD", w=0.5):
+    return ft.Border(
+        left=ft.BorderSide(w, color), right=ft.BorderSide(w, color),
+        top=ft.BorderSide(w, color), bottom=ft.BorderSide(w, color),
+    )
+
+
+def section_label(text):
+    return ft.Text(text, size=12, color=TEXT_SEC, weight="w500")
+
+
+def card(content, padding=16, bg=WHITE):
+    return ft.Container(content=content, bgcolor=bg, border_radius=14,
+                        border=thin_border(), padding=padding)
+
+
+def fmt(key, value):
+    if key in ("calcium", "iron"):
+        return str(int(round(value)))
+    return f"{value:.1f}"
+
+
+STAGE_EMOJI = ["🌱", "🌿", "🌾", "🪴", "🌷", "🌸", "🍎"]
+PLANT_LABELS = [
+    "Just sprouted 🌱", "First leaves appearing", "Growing strong",
+    "In full leaf", "Starting to flower 🌸", "In full bloom", "Bearing fruit! 🍎",
+]
+YN_QUESTIONS = [
+    "Drank 8 glasses of water?", "Ate a colorful meal?",
+    "Moved your body today?", "Had breakfast this morning?",
+]
+GENDER_OPTIONS = {"male": "Male", "female": "Female", "other": "Other"}
+LOCATION_OPTIONS = {
+    "us": "United States", "uk": "United Kingdom", "asia": "East Asia",
+    "latin": "Latin America", "india": "South Asia", "mena": "Middle East / North Africa",
+}
+ALLERGY_LIST = ["Gluten", "Tree nuts", "Dairy", "Soy", "Shellfish", "Eggs"]
+
+
+# ─────────────────────────────────────────────
+# MAIN APP
+# ─────────────────────────────────────────────
+def main(page: ft.Page):
+    page.title = "Grow My Own 🌱"
+    page.bgcolor = CREAM
+    page.padding = 0
+    page.window.width = 420
+    page.window.min_width = 380
+    page.theme = ft.Theme(color_scheme_seed=SAGE)
+
+    # ── File picker (MUST be in overlay to work) ──
+    file_picker = ft.FilePicker()
+    page.overlay.append(file_picker)
+
+    # ── Refs ──
+    garden_panel    = ft.Ref[ft.Column]()
+    nutrition_panel = ft.Ref[ft.Column]()
+    log_panel       = ft.Ref[ft.Column]()
+
+    plant_emoji_ctrl = ft.Ref[ft.Text]()
+    plant_label_ctrl = ft.Ref[ft.Text]()
+    score_ctrl       = ft.Ref[ft.Text]()
+    daily_goal_ctrl  = ft.Ref[ft.Text]()
+    produce_chips_row = ft.Ref[ft.Row]()
+    nutrition_note   = ft.Ref[ft.Text]()
+
+    tab_garden_btn    = ft.Ref[ft.TextButton]()
+    tab_nutrition_btn = ft.Ref[ft.TextButton]()
+    tab_log_btn       = ft.Ref[ft.TextButton]()
+
+    food_autocomplete_ref = ft.Ref[ft.AutoComplete]()
+    log_list_ref          = ft.Ref[ft.Column]()
+
+    # macro / vitamin display refs
+    macro_value = {}   # key -> ft.Text
+    macro_fill  = {}   # key -> ft.Container
+    vit_value   = {}   # key -> ft.Text
+    vit_fill    = {}   # key -> ft.Container
+
+    # mutable holders
+    food_log = []
+    selected_food = {"value": ""}
+    pending_photo = {"description": None, "fdc_id": None, "mass": 100.0}
+    yn_cards = {}
+    selected_allergies = set()
+
+    # dialog refs
+    meal_title_ctrl = ft.Ref[ft.Text]()
+    meal_body_ctrl  = ft.Ref[ft.Text]()
+    meal_dialog     = ft.Ref[ft.AlertDialog]()
+    setup_dialog    = ft.Ref[ft.AlertDialog]()
+    age_dropdown    = ft.Ref[ft.Dropdown]()
+    gender_dropdown = ft.Ref[ft.Dropdown]()
+    location_dropdown = ft.Ref[ft.Dropdown]()
+    loading_text_ctrl = ft.Ref[ft.Text]()
+    loading_dialog    = ft.Ref[ft.AlertDialog]()
+    confirm_desc_ctrl = ft.Ref[ft.Text]()
+    confirm_conf_ctrl = ft.Ref[ft.Text]()
+    confirm_dialog    = ft.Ref[ft.AlertDialog]()
+    manual_field_ref  = ft.Ref[ft.TextField]()
+    manual_error_ref  = ft.Ref[ft.Text]()
+    manual_dialog     = ft.Ref[ft.AlertDialog]()
+
+    # ════════════════════════════════════════
+    # LOADING SCREEN (modal, reusable)
+    # ════════════════════════════════════════
+    def show_loading(message):
+        if loading_text_ctrl.current:
+            loading_text_ctrl.current.value = message
+        if loading_dialog.current:
+            loading_dialog.current.open = True
+        page.update()
+
+    def hide_loading():
+        if loading_dialog.current:
+            loading_dialog.current.open = False
+        page.update()
+
+    loading_dialog_ctrl = ft.AlertDialog(
+        ref=loading_dialog, modal=True,
+        content=ft.Container(
+            width=240,
+            content=ft.Row(
+                [
+                    ft.ProgressRing(width=26, height=26, stroke_width=3, color=SAGE),
+                    ft.Text("Working…", ref=loading_text_ctrl, size=14, color=TEXT_PRI),
+                ],
+                spacing=14, vertical_alignment="center",
+            ),
+            padding=ft.Padding(left=4, right=4, top=10, bottom=10),
+        ),
+    )
+    page.overlay.append(loading_dialog_ctrl)
+
+    # ════════════════════════════════════════
+    # NUTRITION TAB REFRESH
+    # ════════════════════════════════════════
+    def refresh_nutrition():
+        n = state.nutrition()
+        for key in ("calcium", "iron", "total_fiber", "protein", "unsat_fat"):
+            if macro_value.get(key):
+                macro_value[key].value = fmt(key, n[key])
+            target = DAILY_TARGETS[key]
+            pct = min(100, (n[key] / target * 100) if target else 0)
+            if macro_fill.get(key):
+                macro_fill[key].width = max(2, int(pct * 0.9))
+        for vkey in ("vit_a", "vit_c", "vit_d", "vit_e"):
+            target = DAILY_TARGETS[vkey]
+            pct = min(100, round(n[vkey] / target * 100) if target else 0)
+            if vit_value.get(vkey):
+                vit_value[vkey].value = f"{int(pct)}%"
+            if vit_fill.get(vkey):
+                vit_fill[vkey].width = max(2, int(pct * 1.6))
+        page.update()
+
+    # ════════════════════════════════════════
+    # TODAY'S LOG
+    # ════════════════════════════════════════
+    def refresh_log():
+        if not log_list_ref.current:
+            return
+        if food_log:
+            log_list_ref.current.controls = [
+                ft.Text(item, size=13, color=TEXT_PRI) for item in food_log
+            ]
+        else:
+            log_list_ref.current.controls = [
+                ft.Text("Nothing logged yet today.", size=13, color=TEXT_SEC, italic=True)
+            ]
+        page.update()
+
+    def add_to_log(text):
+        food_log.append(text)
+        refresh_log()
+
+    # ════════════════════════════════════════
+    # CORE: log a food (threaded + loading)
+    #   Loading stays up until nutrition is updated.
+    # ════════════════════════════════════════
+    def log_food_by_name(name, source="🍽️"):
+        show_loading("Updating your nutrition…")
+
+        def worker():
+            try:
+                matched, fdc = db.find_match(name)
+                if not fdc:
+                    hide_loading()
+                    open_manual_dialog(error=f"Couldn't find “{name}”. Try another name.")
+                    return
+                nutrients = db.nutrients_for_fdc(fdc)      # per 100 g
+                state.apply_nutrients(nutrients, scale=1.0)
+                add_to_log(f"{source} {matched}")
+                refresh_nutrition()
+            except Exception as e:
+                print("[log_food_by_name]", e)
+            finally:
+                hide_loading()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def log_food_from_photo(description, fdc_id, mass_g, source="📷"):
+        show_loading("Updating your nutrition…")
+
+        def worker():
+            try:
+                nutrients = db.nutrients_for_fdc(fdc_id)   # per 100 g
+                state.apply_nutrients(nutrients, scale=mass_g / 100.0)
+                add_to_log(f"{source} {description}  (~{int(mass_g)} g)")
+                refresh_nutrition()
+            except Exception as e:
+                print("[log_food_from_photo]", e)
+            finally:
+                hide_loading()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ════════════════════════════════════════
+    # PHOTO FLOW: upload -> loading -> confirm -> (yes|manual)
+    # ════════════════════════════════════════
+    async def upload_food_photo(e):
+        files = await file_picker.pick_files(
+            allow_multiple=False,
+            file_type=ft.FilePickerFileType.CUSTOM,
+            allowed_extensions=["jpg", "jpeg", "png"],
+        )
+        if not files:
+            return
+        path = files[0].path
+        if not path:
+            open_manual_dialog(error="Couldn't read that file's path. Type the food instead.")
+            return
+
+        show_loading("Analyzing your photo…")
+
+        def worker():
+            res = get_vision_model().identify(path)
+            hide_loading()
+            if res.get("ok") and res.get("description") and res.get("fdc_id"):
+                pending_photo["description"] = res["description"]
+                pending_photo["fdc_id"]      = res["fdc_id"]
+                pending_photo["mass"]        = res.get("mass", 100.0)
+                open_confirm_dialog(res["description"], res["confidence"], res["mass"])
+            else:
+                reason = res.get("error") or "We couldn't recognize that one."
+                open_manual_dialog(error=f"{reason} Type the food name instead.")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ── Confirm dialog ──
+    def open_confirm_dialog(description, confidence, mass_g):
+        if confirm_desc_ctrl.current:
+            confirm_desc_ctrl.current.value = description
+        if confirm_conf_ctrl.current:
+            confirm_conf_ctrl.current.value = (
+                f"Match confidence {confidence * 100:.0f}% · est. {int(mass_g)} g"
+            )
+        if confirm_dialog.current:
+            confirm_dialog.current.open = True
+        page.update()
+
+    def confirm_yes(e):
+        if confirm_dialog.current:
+            confirm_dialog.current.open = False
+        page.update()
+        log_food_from_photo(pending_photo["description"], pending_photo["fdc_id"],
+                            pending_photo["mass"], source="📷")
+
+    def confirm_no(e):
+        if confirm_dialog.current:
+            confirm_dialog.current.open = False
+        page.update()
+        open_manual_dialog(error="No problem — what was it?")
+
+    confirm_dialog_ctrl = ft.AlertDialog(
+        ref=confirm_dialog, modal=True,
+        title=ft.Text("Does this look right?", size=16, weight="w500", color=FOREST),
+        content=ft.Container(
+            width=300,
+            content=ft.Column([
+                ft.Text("We matched your photo to:", size=13, color=TEXT_SEC),
+                ft.Text("", ref=confirm_desc_ctrl, size=15, weight="w600", color=TEXT_PRI),
+                ft.Text("", ref=confirm_conf_ctrl, size=12, color=TEXT_SEC),
+            ], spacing=6, tight=True),
+            padding=ft.Padding(left=0, right=0, top=6, bottom=6),
+        ),
+        actions=[
+            ft.TextButton("No, type it in", on_click=confirm_no),
+            ft.ElevatedButton("Yes, log it", bgcolor=SAGE, color=WHITE,
+                              style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=10)),
+                              on_click=confirm_yes),
+        ],
+        actions_alignment="end",
+    )
+    page.overlay.append(confirm_dialog_ctrl)
+
+    # ── Manual-entry dialog ──
+    def open_manual_dialog(error=""):
+        if manual_error_ref.current:
+            manual_error_ref.current.value = error or ""
+            manual_error_ref.current.visible = bool(error)
+        if manual_field_ref.current:
+            manual_field_ref.current.value = ""
+        if manual_dialog.current:
+            manual_dialog.current.open = True
+        page.update()
+
+    def manual_cancel(e):
+        if manual_dialog.current:
+            manual_dialog.current.open = False
+        page.update()
+
+    def manual_submit(e):
+        text = (manual_field_ref.current.value or "").strip() if manual_field_ref.current else ""
+        if not text:
+            if manual_error_ref.current:
+                manual_error_ref.current.value = "Please type a food name."
+                manual_error_ref.current.visible = True
+            page.update()
+            return
+        if manual_dialog.current:
+            manual_dialog.current.open = False
+        page.update()
+        log_food_by_name(text, source="✍️")
+
+    manual_dialog_ctrl = ft.AlertDialog(
+        ref=manual_dialog, modal=True,
+        title=ft.Text("What did you eat?", size=16, weight="w500", color=FOREST),
+        content=ft.Container(
+            width=300,
+            content=ft.Column([
+                ft.Text("", ref=manual_error_ref, size=12, color=CORAL, visible=False),
+                ft.TextField(ref=manual_field_ref, hint_text="e.g. banana, raw",
+                             border_radius=10, border_color="#CCCCCC",
+                             focused_border_color=SAGE, text_size=14,
+                             bgcolor=WHITE, color=TEXT_PRI, on_submit=manual_submit),
+            ], spacing=8, tight=True),
+            padding=ft.Padding(left=0, right=0, top=6, bottom=6),
+        ),
+        actions=[
+            ft.TextButton("Cancel", on_click=manual_cancel),
+            ft.ElevatedButton("Log it", bgcolor=SAGE, color=WHITE,
+                              style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=10)),
+                              on_click=manual_submit),
+        ],
+        actions_alignment="end",
+    )
+    page.overlay.append(manual_dialog_ctrl)
+
+    # ════════════════════════════════════════
+    # GARDEN: plant + score + produce + yn
+    # ════════════════════════════════════════
+    def update_plant():
+        state.compute_plant_level()
+        lvl = state.plant_level
+        if plant_emoji_ctrl.current:
+            plant_emoji_ctrl.current.value = STAGE_EMOJI[min(lvl, 6)]
+        if plant_label_ctrl.current:
+            plant_label_ctrl.current.value = PLANT_LABELS[min(lvl, 6)]
+        if score_ctrl.current:
+            score_ctrl.current.value = str(state.overall_score())
+        page.update()
+
+    def rebuild_produce_chips():
+        chips = []
+        for i, item in enumerate(state.produce):
+            def remove(e, idx=i):
+                state.produce.pop(idx)
+                rebuild_produce_chips()
+                update_nutrition_note()
+                update_plant()
+            chips.append(ft.Container(
+                content=ft.Row([
+                    ft.Text(item, size=13, color=FOREST),
+                    ft.IconButton("close", icon_size=14, icon_color=FOREST_LT,
+                                  on_click=remove, padding=0, width=20, height=20),
+                ], spacing=4, tight=True),
+                bgcolor=LEAF_BG, border_radius=20,
+                padding=ft.Padding(left=12, right=4, top=4, bottom=4),
+            ))
+        if produce_chips_row.current:
+            produce_chips_row.current.controls = chips
+            page.update()
+
+    def update_nutrition_note():
+        listed = ", ".join(state.produce) if state.produce else "your logged produce"
+        if nutrition_note.current:
+            nutrition_note.current.value = (
+                f"Garden produce: {listed}. Log foods in the Log tab to fill in your "
+                "nutrition — values are approximations. Tap a fruit for meal ideas!"
+            )
+            page.update()
+
+    produce_field = ft.TextField(
+        hint_text="e.g. apple, spinach, mango...", border_radius=10,
+        border_color="#CCCCCC", focused_border_color=SAGE, text_size=14,
+        expand=True, bgcolor=WHITE, color=TEXT_PRI,
+    )
+
+    def on_add_produce(e):
+        raw = produce_field.value.strip()
+        if not raw:
+            return
+        for item in [s.strip().lower() for s in raw.split(",") if s.strip()]:
+            if item not in state.produce:
+                state.produce.append(item)
+        produce_field.value = ""
+        rebuild_produce_chips()
+        update_nutrition_note()
+        update_plant()
+
+    produce_field.on_submit = on_add_produce
+
+    def make_yn_toggle(idx):
+        def style(active, no=False):
+            if active and no:
+                return ft.ButtonStyle(bgcolor=AMBER_LT, color="#854F0B",
+                                      shape=ft.RoundedRectangleBorder(radius=6))
+            if active:
+                return ft.ButtonStyle(bgcolor=SAGE, color=WHITE,
+                                      shape=ft.RoundedRectangleBorder(radius=6))
+            return ft.ButtonStyle(bgcolor=GRAY_LT, color=TEXT_SEC,
+                                  shape=ft.RoundedRectangleBorder(radius=6))
+
+        def on_yes(e):
+            state.yn_state[idx] = "yes"
+            yn_cards[idx]["yes"].style = style(True)
+            yn_cards[idx]["no"].style = style(False)
+            yn_cards[idx]["box"].bgcolor = LEAF_BG
+            update_plant()
+
+        def on_no(e):
+            state.yn_state[idx] = "no"
+            yn_cards[idx]["no"].style = style(True, no=True)
+            yn_cards[idx]["yes"].style = style(False)
+            yn_cards[idx]["box"].bgcolor = WHITE
+            update_plant()
+
+        yes_btn = ft.ElevatedButton("Yes", style=style(False), on_click=on_yes, width=48, height=30)
+        no_btn  = ft.ElevatedButton("No",  style=style(False), on_click=on_no,  width=48, height=30)
+        box = ft.Container(
+            content=ft.Row([
+                ft.Text(YN_QUESTIONS[idx], size=13, color=TEXT_PRI, expand=True),
+                ft.Row([yes_btn, no_btn], spacing=4, tight=True),
+            ], alignment="spaceBetween"),
+            bgcolor=WHITE, border_radius=12, border=thin_border(),
+            padding=ft.Padding(left=12, right=12, top=10, bottom=10),
+        )
+        yn_cards[idx] = {"yes": yes_btn, "no": no_btn, "box": box}
+        return box
+
+    # ── Meal-ideas dialog ──
+    def open_meal_modal(fruit):
+        if meal_title_ctrl.current:
+            meal_title_ctrl.current.value = f"Meal ideas with {fruit}"
+        if meal_body_ctrl.current:
+            meal_body_ctrl.current.value = "Finding ideas for you…"
+        if meal_dialog.current:
+            meal_dialog.current.open = True
+        page.update()
+
+        def on_result(text):
+            if meal_body_ctrl.current:
+                meal_body_ctrl.current.value = text
+            page.update()
+
+        threading.Thread(target=fetch_meal_ideas, args=(fruit, on_result), daemon=True).start()
+
+    def close_meal_dialog(e):
+        if meal_dialog.current:
+            meal_dialog.current.open = False
+        page.update()
+
+    meal_dialog_ctrl = ft.AlertDialog(
+        ref=meal_dialog,
+        title=ft.Text("", ref=meal_title_ctrl, size=16, weight="w500", color=TEXT_PRI),
+        content=ft.Container(
+            content=ft.Text("", ref=meal_body_ctrl, size=14, color=TEXT_PRI, selectable=True),
+            width=300, padding=ft.Padding(left=0, right=0, top=8, bottom=8),
+        ),
+        actions=[ft.TextButton("Close", on_click=close_meal_dialog)],
+        actions_alignment="end",
+    )
+    page.overlay.append(meal_dialog_ctrl)
+
+    # ════════════════════════════════════════
+    # BUILD: GARDEN TAB
+    # ════════════════════════════════════════
+    def build_garden_tab():
+        garden_box = ft.Container(
+            content=ft.Column([
+                ft.Text("🌱", ref=plant_emoji_ctrl, size=96),
+                ft.Text("", ref=plant_label_ctrl, size=12, color=FOREST, weight="w500"),
+            ], horizontal_alignment="center", spacing=4),
+            bgcolor=LEAF_BG, border_radius=16, padding=20,
+        )
+
+        score_card = card(ft.Column([
+            section_label("OVERALL SCORE"),
+            ft.Container(height=8),
+            ft.Container(
+                content=ft.Text("0", ref=score_ctrl, size=40, weight="w600",
+                                color=FOREST, text_align="center"),
+                alignment=ft.Alignment(0, 0), bgcolor=LEAF_BG,
+                border_radius=16, padding=20,
+            ),
+        ], horizontal_alignment="center"))
+
+        yn_grid = ft.Column([make_yn_toggle(i) for i in range(len(YN_QUESTIONS))], spacing=8)
+
+        produce_row = ft.Row([
+            produce_field,
+            ft.ElevatedButton("Add", height=44, on_click=on_add_produce,
+                              style=ft.ButtonStyle(bgcolor=SAGE, color=WHITE,
+                                  shape=ft.RoundedRectangleBorder(radius=10),
+                                  padding=ft.Padding(left=16, right=16, top=0, bottom=0))),
+        ], spacing=8)
+        produce_chips = ft.Row(ref=produce_chips_row, wrap=True, spacing=6, run_spacing=6)
+
+        return ft.Column(
+            ref=garden_panel, scroll="auto", spacing=0, visible=True,
+            controls=[
+                ft.Container(height=4),
+                ft.Container(garden_box, padding=ft.Padding(left=16, right=16, top=0, bottom=0)),
+                ft.Container(score_card, padding=ft.Padding(left=16, right=16, top=8, bottom=0)),
+                ft.Container(height=8),
+                ft.Container(
+                    content=ft.Column([
+                        section_label("HOW ARE YOU DOING TODAY?"),
+                        ft.Container(height=8), yn_grid,
+                        ft.Container(height=16),
+                        section_label("WHAT PRODUCE DID YOU HAVE?"),
+                        ft.Container(height=8), produce_row,
+                        ft.Container(height=8), produce_chips,
+                    ]),
+                    padding=ft.Padding(left=16, right=16, top=0, bottom=0),
+                ),
+                ft.Container(height=16),
+            ],
+        )
+
+    # ════════════════════════════════════════
+    # BUILD: NUTRITION TAB
+    # ════════════════════════════════════════
+    def make_macro_card(key, label, unit, color=SAGE):
+        val = ft.Text("0", size=22, weight="w500", color=TEXT_PRI)
+        fill = ft.Container(bgcolor=color, border_radius=3, height=5, width=2)
+        macro_value[key] = val
+        macro_fill[key] = fill
+        return ft.Container(
+            content=ft.Column([
+                ft.Text(label, size=12, color=TEXT_SEC),
+                ft.Row([val, ft.Text(unit, size=12, color=TEXT_SEC)],
+                       spacing=3, vertical_alignment="end"),
+                ft.Container(
+                    content=ft.Row([fill,
+                                    ft.Container(bgcolor=GRAY_LT, border_radius=3, height=5, expand=True)],
+                                   spacing=0),
+                    margin=ft.Margin(left=0, right=0, top=8, bottom=0),
+                ),
+            ], spacing=2),
+            bgcolor=WHITE, border_radius=14, border=thin_border(),
+            padding=14, expand=True,
+        )
+
+    def make_vit_row(key, label, color=SAGE):
+        fill = ft.Container(bgcolor=color, border_radius=3, height=6, width=2)
+        lbl = ft.Text("0%", size=12, color=TEXT_SEC, width=40, text_align="right")
+        vit_fill[key] = fill
+        vit_value[key] = lbl
+        return ft.Row([
+            ft.Text(label, size=13, color=TEXT_PRI, width=110),
+            ft.Container(
+                content=ft.Row([fill,
+                                ft.Container(bgcolor=GRAY_LT, border_radius=3, height=6, expand=True)],
+                               spacing=0),
+                expand=True),
+            lbl,
+        ], spacing=10)
+
+    def build_nutrition_tab():
+        macro_grid = ft.Column([
+            ft.Row([make_macro_card("calcium", "Calcium", "mg", SAGE),
+                    make_macro_card("iron", "Iron", "mg", SAGE)], spacing=8),
+            ft.Row([make_macro_card("total_fiber", "Total fiber", "g", AMBER),
+                    make_macro_card("protein", "Plant protein", "g", BLUE)], spacing=8),
+            ft.Row([make_macro_card("unsat_fat", "Unsaturated fats", "g", CORAL)]),
+        ], spacing=8)
+
+        vit_section = ft.Column([
+            section_label("KEY VITAMINS (% DAILY TARGET)"),
+            ft.Container(height=8),
+            make_vit_row("vit_a", "Vitamin A", AMBER),
+            make_vit_row("vit_c", "Vitamin C", SAGE),
+            make_vit_row("vit_d", "Vitamin D", BLUE),
+            make_vit_row("vit_e", "Vitamin E", CORAL),
+        ], spacing=10)
+
+        note = ft.Text(ref=nutrition_note, value="", size=11, color=TEXT_SEC,
+                       italic=True, no_wrap=False)
+
+        return ft.Column(
+            ref=nutrition_panel, scroll="auto", spacing=8, visible=False,
+            controls=[
+                ft.Container(height=4),
+                ft.Container(macro_grid, padding=ft.Padding(left=16, right=16, top=0, bottom=0)),
+                ft.Container(vit_section, padding=ft.Padding(left=16, right=16, top=0, bottom=0),
+                             margin=ft.Margin(left=0, right=0, top=8, bottom=0)),
+                ft.Container(note, padding=ft.Padding(left=16, right=16, top=0, bottom=0),
+                             margin=ft.Margin(left=0, right=0, top=8, bottom=16)),
+            ],
+        )
+
+    # ════════════════════════════════════════
+    # BUILD: LOG TAB
+    # ════════════════════════════════════════
+    def add_food(e):
+        name = selected_food["value"].strip()
+        if not name:
+            open_manual_dialog(error="Pick a food from the suggestions, or type it here.")
+            return
+        selected_food["value"] = ""
+        log_food_by_name(name, source="🍽️")
+
+    def on_food_select(e):
+        try:
+            selected_food["value"] = e.selection.value
+        except Exception:
+            pass
+
+    def build_log_tab():
+        suggestions = [
+            ft.AutoCompleteSuggestion(key=d, value=d)
+            for d in db.descriptions()[:MAX_AUTOCOMPLETE_SUGGESTIONS]
+        ]
+
+        type_card = card(ft.Column([
+            section_label("LOG A FOOD"),
+            ft.Container(height=8),
+            ft.AutoComplete(ref=food_autocomplete_ref, suggestions=suggestions,
+                            on_select=on_food_select),
+            ft.Container(height=8),
+            ft.ElevatedButton("Add Food", icon="add", bgcolor=SAGE, color=WHITE,
+                              on_click=add_food),
+        ]))
+
+        photo_card = card(ft.Column([
+            section_label("SCAN A MEAL"),
+            ft.Container(height=8),
+            ft.Text("Take a photo and we'll identify the food, then ask you to confirm.",
+                    size=13, color=TEXT_SEC),
+            ft.Container(height=8),
+            ft.ElevatedButton("📷 Upload Photo", bgcolor=BLUE, color=WHITE,
+                              on_click=upload_food_photo),
+        ]))
+
+        history_card = card(ft.Column([
+            ft.Row([
+                section_label("TODAY'S LOG"),
+                ft.TextButton("Reset day", on_click=reset_day,
+                              style=ft.ButtonStyle(color=CORAL)),
+            ], alignment="spaceBetween"),
+            ft.Container(height=4),
+            ft.Column(ref=log_list_ref, spacing=8),
+        ]))
+
+        return ft.Column(
+            ref=log_panel, visible=False, scroll="auto",
+            controls=[
+                ft.Container(height=4),
+                ft.Container(type_card, padding=ft.Padding(16, 0, 16, 0)),
+                ft.Container(height=8),
+                ft.Container(photo_card, padding=ft.Padding(16, 0, 16, 0)),
+                ft.Container(height=8),
+                ft.Container(history_card, padding=ft.Padding(16, 0, 16, 16)),
+            ],
+        )
+
+    def reset_day(e):
+        state.reset_day()
+        food_log.clear()
+        for i in yn_cards:
+            yn_cards[i]["yes"].style = ft.ButtonStyle(bgcolor=GRAY_LT, color=TEXT_SEC,
+                                                      shape=ft.RoundedRectangleBorder(radius=6))
+            yn_cards[i]["no"].style = ft.ButtonStyle(bgcolor=GRAY_LT, color=TEXT_SEC,
+                                                     shape=ft.RoundedRectangleBorder(radius=6))
+            yn_cards[i]["box"].bgcolor = WHITE
+        refresh_log()
+        refresh_nutrition()
+        update_plant()
+
+    # ════════════════════════════════════════
+    # HEADER + TABS
+    # ════════════════════════════════════════
+    def build_header():
+        return ft.Container(
+            content=ft.Row([
+                ft.Row([
+                    ft.Text("bl", size=22, weight="w500", color=FOREST),
+                    ft.Text("oo", size=22, weight="w500", color=SAGE),
+                    ft.Text("m", size=22, weight="w500", color=FOREST),
+                ], spacing=0, tight=True),
+                ft.Container(
+                    content=ft.Row([ft.Text("🌿", size=14),
+                                    ft.Text("3 day streak", size=12, color=FOREST_LT, weight="w500")],
+                                   spacing=4, tight=True),
+                    bgcolor=LEAF_BG, border_radius=20,
+                    padding=ft.Padding(left=10, right=10, top=5, bottom=5),
+                ),
+            ], alignment="spaceBetween"),
+            padding=ft.Padding(left=16, right=16, top=16, bottom=8),
+        )
+
+    def tab_style(active):
+        return ft.ButtonStyle(
+            bgcolor=WHITE if active else "transparent",
+            color=FOREST if active else TEXT_SEC,
+            shape=ft.RoundedRectangleBorder(radius=10),
+            padding=ft.Padding(left=20, right=20, top=8, bottom=8),
+            overlay_color="transparent",
+        )
+
+    def switch_tab(name):
+        if garden_panel.current:
+            garden_panel.current.visible = (name == "garden")
+        if nutrition_panel.current:
+            nutrition_panel.current.visible = (name == "nutrition")
+        if log_panel.current:
+            log_panel.current.visible = (name == "log")
+        page.update()
+
+    def on_garden_tab(e):
+        tab_garden_btn.current.style = tab_style(True)
+        tab_nutrition_btn.current.style = tab_style(False)
+        tab_log_btn.current.style = tab_style(False)
+        switch_tab("garden")
+
+    def on_nutrition_tab(e):
+        tab_garden_btn.current.style = tab_style(False)
+        tab_nutrition_btn.current.style = tab_style(True)
+        tab_log_btn.current.style = tab_style(False)
+        switch_tab("nutrition")
+
+    def on_log_tab(e):
+        tab_garden_btn.current.style = tab_style(False)
+        tab_nutrition_btn.current.style = tab_style(False)
+        tab_log_btn.current.style = tab_style(True)
+        switch_tab("log")
+
+    tab_bar = ft.Container(
+        content=ft.Row([
+            ft.TextButton("Garden", ref=tab_garden_btn, style=tab_style(True), on_click=on_garden_tab),
+            ft.TextButton("Nutrition", ref=tab_nutrition_btn, style=tab_style(False), on_click=on_nutrition_tab),
+            ft.TextButton("Log", ref=tab_log_btn, style=tab_style(False), on_click=on_log_tab),
+        ], spacing=4),
+        bgcolor=GRAY_LT, border_radius=14, padding=4,
+        margin=ft.Margin(left=16, right=16, top=0, bottom=0),
+    )
+
+    # ════════════════════════════════════════
+    # SETUP DIALOG (first launch)
+    # ════════════════════════════════════════
+    allergy_chip_controls = {}
+
+    def toggle_allergy(name, container):
+        def handler(e):
+            if name in selected_allergies:
+                selected_allergies.discard(name)
+                container.bgcolor = GRAY_LT
+                container.border = thin_border("#CCCCCC")
+                container.content.color = TEXT_SEC
+            else:
+                selected_allergies.add(name)
+                container.bgcolor = LEAF_BG
+                container.border = thin_border(SAGE)
+                container.content.color = FOREST
+            page.update()
+        return handler
+
+    def build_allergy_chips():
+        chips = []
+        for name in ALLERGY_LIST:
+            label = ft.Text(name, size=13, color=TEXT_SEC)
+            chip = ft.Container(content=label, bgcolor=GRAY_LT, border_radius=20,
+                                border=thin_border("#CCCCCC"),
+                                padding=ft.Padding(left=12, right=12, top=5, bottom=5))
+            chip.on_click = toggle_allergy(name, chip)
+            allergy_chip_controls[name] = chip
+            chips.append(chip)
+        return chips
+
+    def finish_setup(e):
+        state.age = age_dropdown.current.value or "18"
+        state.gender = gender_dropdown.current.value or "Male"
+        state.location = location_dropdown.current.value or "us"
+        state.allergies = list(selected_allergies)
+        if setup_dialog.current:
+            setup_dialog.current.open = False
+        if daily_goal_ctrl.current:
+            daily_goal_ctrl.current.value = "Generating your goal…"
+        page.update()
+        threading.Thread(
+            target=fetch_daily_goal,
+            args=(lambda text: (setattr(daily_goal_ctrl.current, "value", text), page.update())
+                  if daily_goal_ctrl.current else None,),
+            daemon=True,
+        ).start()
+
+    setup_dialog_ctrl = ft.AlertDialog(
+        ref=setup_dialog, modal=True,
+        title=ft.Column([
+            ft.Text("🌱", size=28),
+            ft.Text("Welcome to Grow My Own", size=18, weight="w500", color=FOREST),
+            ft.Text("Let's personalize your garden.", size=13, color=TEXT_SEC),
+        ], spacing=4, tight=True),
+        content=ft.Container(
+            width=340, height=420,
+            content=ft.Column([
+                ft.Text("Age", size=13, weight="w500", color=TEXT_PRI),
+                ft.Dropdown(ref=age_dropdown,
+                            options=[ft.dropdown.Option(str(i)) for i in range(13, 101)],
+                            value="18", border_color="#CCCCCC", focused_border_color=SAGE,
+                            text_size=14, color=TEXT_PRI),
+                ft.Text("Gender", size=13, weight="w500", color=TEXT_PRI),
+                ft.Dropdown(ref=gender_dropdown,
+                            options=[ft.dropdown.Option(k, v) for k, v in GENDER_OPTIONS.items()],
+                            value="male", border_color="#CCCCCC", focused_border_color=SAGE,
+                            text_size=14, color=TEXT_PRI),
+                ft.Text("Location (for meal ideas)", size=13, weight="w500", color=TEXT_PRI),
+                ft.Dropdown(ref=location_dropdown,
+                            options=[ft.dropdown.Option(k, v) for k, v in LOCATION_OPTIONS.items()],
+                            value="us", border_color="#CCCCCC", focused_border_color=SAGE,
+                            text_size=14, color=TEXT_PRI),
+                ft.Text("Allergies / avoidances", size=13, weight="w500", color=TEXT_PRI),
+                ft.Row(build_allergy_chips(), wrap=True, spacing=6, run_spacing=6),
+            ], spacing=8, scroll="auto"),
+        ),
+        actions=[ft.ElevatedButton("Start my garden →", bgcolor=FOREST, color=WHITE,
+                                   style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=10)),
+                                   on_click=finish_setup)],
+        actions_alignment="center",
+    )
+    page.overlay.append(setup_dialog_ctrl)
+
+    # ════════════════════════════════════════
+    # DAILY GOAL CARD (garden header strip)
+    # ════════════════════════════════════════
+    daily_goal_card = ft.Container(
+        content=ft.Column([
+            section_label("TODAY'S TINY GOAL"),
+            ft.Text("Set up your garden to get a goal…", ref=daily_goal_ctrl,
+                    size=14, color=TEXT_PRI),
+        ], spacing=6),
+        bgcolor=AMBER_LT, border_radius=14,
+        padding=14, margin=ft.Margin(left=16, right=16, top=0, bottom=0),
+    )
+
+    # ════════════════════════════════════════
+    # ASSEMBLE
+    # ════════════════════════════════════════
+    garden_tab = build_garden_tab()
+    nutrition_tab = build_nutrition_tab()
+    log_tab = build_log_tab()
+
+    page.add(ft.Column([
+        build_header(),
+        tab_bar,
+        ft.Container(height=8),
+        daily_goal_card,
+        ft.Container(height=8),
+        garden_tab,
+        nutrition_tab,
+        log_tab,
+    ], spacing=0, expand=True))
+
+    # initial paint
+    rebuild_produce_chips()
+    update_nutrition_note()
+    refresh_nutrition()
+    refresh_log()
+    update_plant()
+
+    setup_dialog_ctrl.open = True
+    page.update()
+
+
+# ─────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    ft.app(target=main)
