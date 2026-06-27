@@ -72,12 +72,12 @@ class AppState:
 
     # ── Nutrition estimates (per 1 serving) ──
     BASE = dict(
-            sol_fiber=0, insol_fiber=0, total_fiber=0,
+            calcium=0, iron=0, total_fiber=0,
             protein=0, unsat_fat=0,
             vit_a=0, vit_c=0, vit_d=0, vit_e=0,
         )
         
-    MAX = dict(sol_fiber=5, insol_fiber=6, total_fiber=11, protein=14, unsat_fat=8)
+    MAX = dict(calcium=5, iron=6, total_fiber=11, protein=14, unsat_fat=8)
 
     def nutrition(self):
         s = self.serving
@@ -286,6 +286,7 @@ def fetch_meal_ideas(fruit, callback):
         callback("Couldn't load ideas right now — check your API key and try again!")
 
 
+
 def ai_food_checker(user_image):
     import torch
     import open_clip
@@ -384,7 +385,6 @@ def ai_food_checker(user_image):
     #print(f"Query: 'lemon'")
     print(f"Closest Match in CSV: {descriptions[best_match_index]}")
     print(f"Confidence Score: {highest_score:.4f} (closer to 1.0 means a tighter match)")
-
     target = descriptions[best_match_index]
 
 
@@ -639,6 +639,8 @@ def ai_food_checker(user_image):
     relative_calories = calories * relative_mass
 
     print(f"Relative Calories: {relative_calories}")
+    return descriptions[best_match_index]
+
 # ─────────────────────────────────────────────
 # MAIN APP
 # ─────────────────────────────────────────────
@@ -661,25 +663,77 @@ def main(page: ft.Page):
     page.window.min_width = 380
     page.fonts        = {}
     page.theme        = ft.Theme(color_scheme_seed=SAGE)
-    
+    loading_text = ft.Text("Analyzing...", size=16)
+
+    loading_dialog = ft.AlertDialog(
+        modal=True,
+        content=ft.Container(
+            width=250,
+            padding=20,
+            content=ft.Column(
+                [
+                    ft.ProgressRing(),
+                    loading_text,
+                ],
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=20,
+                tight=True,
+            ),
+        ),
+    )
+
+    page.overlay.append(loading_dialog)
     # Initialize without parameters or appending to overlay
     pick_files_dialog = ft.FilePicker()
+
+
+
+    def show_loading(message="Loading..."):
+        loading_text.value = message
+        loading_dialog.open = True
+        page.update()
+
+
+    def hide_loading():
+        loading_dialog.open = False
+        page.update()
     
     # This must be an async function to capture the new file picker returns
+    
+
     async def upload_food_photo(e):
         result = await pick_files_dialog.pick_files(
             allow_multiple=False,
-            allowed_extensions=["jpg", "jpeg", "png"]
+            allowed_extensions=["jpg", "jpeg", "png"],
         )
-        
-        # Check if the user selected a file or cancelled
-        if result:
-            file = result[0]
-            food_log.append(f"📷 Photo logged: {file.path}")
-            ai_food_checker(file.path)
-            refresh_log()           
 
-            # No page.update() needed here if refresh_log() handles it
+        if not result:
+            return
+
+        file = result[0]
+        refresh_log()
+
+        show_loading("Analyzing your photo...This may take 15-20 seconds.")
+        page.update()
+
+
+        def worker():
+            try:
+                target = ai_food_checker(file.path)
+                food_log.append(target)
+                add_food_to_nutrition(target)
+            except Exception as ex:
+                print(ex)
+            finally:
+                page.run_thread(finish_loading)
+            
+        def finish_loading():
+            hide_loading()
+            refresh_nutrition()
+            refresh_log()
+            page.update()
+        
+        threading.Thread(target=worker, daemon=True).start()
 
 
     # ── Shared refs ──────────────────────────
@@ -695,10 +749,12 @@ def main(page: ft.Page):
     produce_chips_row = ft.Ref[ft.Row]()
     streak_ctrl       = ft.Ref[ft.Text]()
     food_autocomplete_ref = ft.Ref[ft.AutoComplete]()
+    loading_text_ref = ft.Ref[ft.Text]()
+    loading_dialog_ref = ft.Ref[ft.AlertDialog]()
 
     # Nutrition refs
-    sol_fiber_ctrl    = ft.Ref[ft.Text]()
-    insol_fiber_ctrl  = ft.Ref[ft.Text]()
+    calcium_ctrl    = ft.Ref[ft.Text]()
+    iron_ctrl  = ft.Ref[ft.Text]()
     total_fiber_ctrl  = ft.Ref[ft.Text]()
     protein_ctrl      = ft.Ref[ft.Text]()
     unsat_fat_ctrl    = ft.Ref[ft.Text]()
@@ -786,12 +842,12 @@ def main(page: ft.Page):
     def refresh_nutrition():
         n = state.nutrition()
         refs = {
-            "sol_fiber": sol_fiber_ctrl, "insol_fiber": insol_fiber_ctrl,
+            "calcium": calcium_ctrl, "iron": iron_ctrl,
             "total_fiber": total_fiber_ctrl, "protein": protein_ctrl,
             "unsat_fat": unsat_fat_ctrl,
         }
         labels = {
-            "sol_fiber": "sol_fiber", "insol_fiber": "insol_fiber",
+            "calcium": "calcium", "iron": "iron",
             "total_fiber": "total_fiber", "protein": "protein", "unsat_fat": "unsat_fat",
         }
         for key, ref in refs.items():
@@ -1253,8 +1309,8 @@ def main(page: ft.Page):
         # )
 
         macro_row1 = ft.Row([
-            make_macro_card("Soluble fiber",   sol_fiber_ctrl,   "g",  SAGE),
-            make_macro_card("Insoluble fiber", insol_fiber_ctrl, "g",  SAGE),
+            make_macro_card("Calcium",   calcium_ctrl,   "mg",  SAGE),
+            make_macro_card("Iron", iron_ctrl, "mg",  SAGE),
         ], spacing=8)
 
         macro_row2 = ft.Row([
@@ -1284,7 +1340,7 @@ def main(page: ft.Page):
 
         # Set initial values
         for ref, key in [
-            (sol_fiber_ctrl, "sol_fiber"), (insol_fiber_ctrl, "insol_fiber"),
+            (calcium_ctrl, "calcium"), (iron_ctrl, "iron"),
             (total_fiber_ctrl, "total_fiber"), (protein_ctrl, "protein"),
             (unsat_fat_ctrl, "unsat_fat"),
         ]:
@@ -1482,17 +1538,8 @@ def main(page: ft.Page):
         tab_log_btn.current.style       = tab_style(True)
         switch_tab("log")
 
-    def add_food(e):
-        # 1. Read directly from the AutoComplete widget
-        text = food_autocomplete_ref.current.value.strip() if food_autocomplete_ref.current else ""
-        
-        if not text:
-            return  # Stop if it's empty
-            
-        # 2. Add to your log list
-        food_log.append(text)
-        print(food_log)
 
+    def add_food_to_nutrition(text):
         with open(r"C:\Users\arnav\OneDrive\Desktop\app\food.csv", "r", newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
@@ -1510,12 +1557,12 @@ def main(page: ft.Page):
 
                 amount = float(row["amount"])
                 nutrient = row["nutrient_id"]
+                
+                if nutrient == "301":
+                    state.BASE["calcium"] += amount
 
-                if nutrient == "295":
-                    state.BASE["sol_fiber"] += amount
-
-                elif nutrient == "297":
-                    state.BASE["insol_fiber"] += amount
+                elif nutrient == "303":
+                     state.BASE["iron"] += amount
 
                 elif nutrient == "291":
                     state.BASE["total_fiber"] += amount
@@ -1544,12 +1591,32 @@ def main(page: ft.Page):
 
                    
 
-        # 3. Safely wipe the visual layout text
-        food_autocomplete_ref.current.value = ""
-        refresh_nutrition()
-        e.page.update()
+        # # 3. Safely wipe the visual layout text
+        # food_autocomplete_ref.current.value = ""
+    def add_food(e):
+        text = food_autocomplete_ref.current.value.strip() if food_autocomplete_ref.current else ""
 
-    
+        show_loading("Adding food...")
+        page.update()
+
+        def worker():
+            try:
+                food_log.append(text)
+                add_food_to_nutrition(text)
+            except Exception as ex:
+                print(ex)
+            finally:
+                page.run_thread(finish_loading)
+
+        def finish_loading():
+            hide_loading()
+            refresh_log()
+            refresh_nutrition()
+            food_autocomplete_ref.current.value = ""
+            page.update()
+            e.page.update()
+        
+        threading.Thread(target=worker, daemon=True).start()
 
 
     tab_bar = ft.Container(
