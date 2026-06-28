@@ -24,6 +24,9 @@ import cv2
 from PIL import Image
 import os
 import csv
+from google import genai
+import re
+
 
 # ─────────────────────────────────────────────
 # THEME / PALETTE
@@ -413,9 +416,13 @@ def ai_food_checker(user_image):
     # =========================================================
 
     FOOD_CATEGORIES = [
+        "a fruit on a plate",
+        "a whole citrus fruit",
+        "a lemon",
         "a pile of vegetables on a plate",
         "a pile of rice or grains on a plate",
         "a cooked solid meal on a plate",
+        "a dessert or baked good",
         "a soda can",
         "a beverage bottle",
         "a drink container",
@@ -524,11 +531,24 @@ def ai_food_checker(user_image):
         values = depth[boundary == 1]
         plate_depth = np.median(values) if len(values) > 10 else np.median(depth)
 
-        height = np.clip(plate_depth - depth, 0, None)
+        #height = np.clip(plate_depth - depth, 0, None)
+        height = np.abs(plate_depth - depth)
+
         height *= mask
 
         pixel_area = pixel_to_cm ** 2
         volume = np.sum(height * pixel_area)
+
+        print("Plate depth:", plate_depth)
+        print("Max depth:", depth.max())
+        print("Min depth:", depth.min())
+        print("Max height:", np.max(height))
+        print("Mask pixels:", np.sum(mask))
+        print("Pixel area:", pixel_area)
+        print("Volume:", volume)
+        print("Median food depth:", np.median(depth[mask]))
+        print("Mean food depth:", np.mean(depth[mask]))
+
 
         return volume
 
@@ -641,6 +661,48 @@ def ai_food_checker(user_image):
     print(f"Relative Calories: {relative_calories}")
     return descriptions[best_match_index]
 
+
+
+from google import genai
+import json
+import re
+
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+
+def get_serving_options(food):
+
+    prompt = f"""
+Food: {food}
+
+Return exactly 3 realistic serving sizes.
+
+Rules:
+- Use common household servings.
+- Include approximate grams.
+- Increasing size.
+- Return ONLY JSON.
+
+Example:
+
+[
+    {{"label":"Small apple", "grams":120}},
+    {{"label":"Medium apple", "grams":180}},
+    {{"label":"Large apple", "grams":250}}
+]
+"""
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+    )
+
+    text = response.text.strip()
+
+    # Remove markdown if Gemini adds it
+    text = re.sub(r"```json|```", "", text).strip()
+    print(response.text)
+    return json.loads(text)
 # ─────────────────────────────────────────────
 # MAIN APP
 # ─────────────────────────────────────────────
@@ -687,12 +749,79 @@ def main(page: ft.Page):
     pick_files_dialog = ft.FilePicker()
 
 
+    serving_dialog = ft.AlertDialog(
+        modal=True,
+        title=ft.Text(""),
+        content=ft.Text(""),
+        actions=[]
+)
+
+    page.overlay.append(serving_dialog)
+
+    def show_serving_dialog(food, options):
+
+        hide_loading()
+
+
+        serving_dropdown.options = [
+            ft.dropdown.Option(
+                key=str(x["grams"]),
+                text=f'{x["label"]} (~{x["grams"]} g)'
+            )
+            for x in options
+        ]
+
+        if not options:
+            print("No serving options returned!")
+            return
+
+        serving_dropdown.value = str(options[0]["grams"])    
+    
+
+        def confirm(e):
+
+            grams = float(serving_dropdown.value)
+
+            relative_mass = grams / 100
+
+            food_log.append(food)
+
+            add_food_to_nutrition(food)
+
+            # Scale nutrients
+            for nutrient in state.BASE:
+                state.BASE[nutrient] *= relative_mass
+
+            refresh_log()
+            refresh_nutrition()
+
+            serving_dialog.open = False
+
+            page.update()
+
+        serving_dialog.title = ft.Text(food)
+
+        serving_dialog.content = ft.Column(
+            [
+                ft.Text("Choose the closest serving size:"),
+
+                serving_dropdown,
+            ],
+            tight=True,
+        )
+
+        serving_dialog.actions = [
+            ft.ElevatedButton("Confirm", on_click=confirm)
+        ]
+
+        serving_dialog.open = True
+
+        page.update()
 
     def show_loading(message="Loading..."):
         loading_text.value = message
         loading_dialog.open = True
         page.update()
-
 
     def hide_loading():
         loading_dialog.open = False
@@ -713,15 +842,19 @@ def main(page: ft.Page):
         file = result[0]
         refresh_log()
 
-        show_loading("Analyzing your photo...This may take 15-20 seconds.")
+        show_loading("Analyzing your photo...This may take a minute.")
         page.update()
 
 
         def worker():
             try:
+                #target = ai_food_checker(file.path)
+                #food_log.append(target)
+                #add_food_to_nutrition(target)
+
                 target = ai_food_checker(file.path)
-                food_log.append(target)
-                add_food_to_nutrition(target)
+                detected_food["value"] = target
+                page.run_thread(show_confirmation_dialog)
             except Exception as ex:
                 print(ex)
             finally:
@@ -751,6 +884,52 @@ def main(page: ft.Page):
     food_autocomplete_ref = ft.Ref[ft.AutoComplete]()
     loading_text_ref = ft.Ref[ft.Text]()
     loading_dialog_ref = ft.Ref[ft.AlertDialog]()
+    detected_food = {"value": ""}
+    serving_options = []
+    selected_grams = 100
+
+    serving_dropdown = ft.Dropdown(width=250)
+    confirm_text = ft.Text()
+
+    confirm_dialog = ft.AlertDialog(
+        modal=True,
+        title=ft.Text("Is this correct?"),
+        content=confirm_text,
+    )
+    page.overlay.append(confirm_dialog)
+
+    def confirm_yes(e):
+        food = detected_food["value"]
+
+        food_log.append(food)
+        add_food_to_nutrition(food)
+
+        refresh_log()
+        refresh_nutrition()
+
+        confirm_dialog.open = False
+        page.update()
+    
+    def confirm_no(e):
+        confirm_dialog.open = False
+
+        food_autocomplete_ref.current.value = detected_food["value"]
+
+        page.update()
+
+
+    def show_confirmation_dialog():
+        hide_loading()
+
+        confirm_text.value = f"We detected:\n\n{detected_food['value']}"
+
+        confirm_dialog.actions = [
+            ft.ElevatedButton("✓ Correct", on_click=confirm_yes),
+            ft.OutlinedButton("✗ Wrong", on_click=confirm_no),
+        ]
+
+        confirm_dialog.open = True
+        page.update()
 
     # Nutrition refs
     calcium_ctrl    = ft.Ref[ft.Text]()
@@ -1291,23 +1470,6 @@ def main(page: ft.Page):
     def build_nutrition_tab():
         n = state.nutrition()
 
-        #serving_slider = ft.Slider(
-        #    min=0.5, max=4, divisions=7, value=1,
-        #    active_color=SAGE, inactive_color=LEAF_MID,
-        #    on_change=on_serving_change,
-        #)
-        # serving_row = ft.Container(
-        #     content=ft.Row([
-        #         #ft.Text("Servings", size=13, color=TEXT_SEC, width=70),
-        #         #ft.Container(serving_slider, expand=True),
-        #         ft.Text("1.0×", ref=serving_label, size=14,
-        #                 weight="w500", color=FOREST, width=40),
-        #     ], spacing=8),
-        #     bgcolor=GRAY_LT,
-        #     border_radius=12,
-        #     padding=ft.Padding(left=14, right=14, top=10, bottom=10),
-        # )
-
         macro_row1 = ft.Row([
             make_macro_card("Calcium",   calcium_ctrl,   "mg",  SAGE),
             make_macro_card("Iron", iron_ctrl, "mg",  SAGE),
@@ -1589,35 +1751,29 @@ def main(page: ft.Page):
                 elif nutrient == "323":
                     state.BASE["vit_e"] += amount
 
-                   
 
-        # # 3. Safely wipe the visual layout text
-        # food_autocomplete_ref.current.value = ""
     def add_food(e):
-        text = food_autocomplete_ref.current.value.strip() if food_autocomplete_ref.current else ""
 
-        show_loading("Adding food...")
-        page.update()
+        food = food_autocomplete_ref.current.value.strip()
+
+        if not food:
+            return
+
+        show_loading("Finding serving sizes...")
 
         def worker():
             try:
-                food_log.append(text)
-                add_food_to_nutrition(text)
+                options = get_serving_options(food)
+
+                print("OPTIONS:", options)
+
+                page.run_thread(lambda: show_serving_dialog(food, options))
+
             except Exception as ex:
                 print(ex)
-            finally:
-                page.run_thread(finish_loading)
+                page.run_thread(hide_loading)
 
-        def finish_loading():
-            hide_loading()
-            refresh_log()
-            refresh_nutrition()
-            food_autocomplete_ref.current.value = ""
-            page.update()
-            e.page.update()
-        
         threading.Thread(target=worker, daemon=True).start()
-
 
     tab_bar = ft.Container(
         content=ft.Row([
