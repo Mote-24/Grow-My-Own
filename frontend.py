@@ -779,25 +779,30 @@ def main(page: ft.Page):
     
 
         def confirm(e):
+            show_loading("Adding food to log...")
+            def worker():
+                try:
+                    grams = float(serving_dropdown.value)
 
-            grams = float(serving_dropdown.value)
+                    relative_mass = grams / 100
 
-            relative_mass = grams / 100
+                    food_log.append(food)
 
-            food_log.append(food)
+                    add_food_to_nutrition(food)
 
-            add_food_to_nutrition(food)
+                    # Scale nutrients
+                    for nutrient in state.BASE:
+                        state.BASE[nutrient] *= relative_mass
 
-            # Scale nutrients
-            for nutrient in state.BASE:
-                state.BASE[nutrient] *= relative_mass
-
-            refresh_log()
-            refresh_nutrition()
-
-            serving_dialog.open = False
-
-            page.update()
+                    refresh_log()
+                    refresh_nutrition()
+                except Exception as ex:
+                    print(ex)
+                finally:
+                    page.run_thread(hide_loading)
+                    hide_loading()
+                    page.update()
+            threading.Thread(target=worker, daemon=True).start()
 
         serving_dialog.title = ft.Text(food)
 
@@ -1769,12 +1774,12 @@ def main(page: ft.Page):
 
                 page.run_thread(lambda: show_serving_dialog(food, options))
 
+                page.run_thread(hide_loading)
+                hide_loading()
             except Exception as ex:
                 print(ex)
-                page.run_thread(hide_loading)
 
         threading.Thread(target=worker, daemon=True).start()
-
     tab_bar = ft.Container(
         content=ft.Row([
             ft.TextButton("Garden",    ref=tab_garden_btn,
