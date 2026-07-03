@@ -779,36 +779,25 @@ def main(page: ft.Page):
     
 
         def confirm(e):
+
+            grams = float(serving_dropdown.value)
+
+            relative_mass = grams / 100
+
+            food_log.append(food)
+
+            add_food_to_nutrition(food)
+
+            # Scale nutrients
+            for nutrient in state.BASE:
+                state.BASE[nutrient] *= relative_mass
+
+            refresh_log()
+            refresh_nutrition()
+
             serving_dialog.open = False
-            #loading_dialog.open = False
+
             page.update()
-            show_loading("Adding food to log...")
-            def worker():
-                try:
-                    grams = float(serving_dropdown.value)
-
-                    relative_mass = grams / 100
-
-                    food_log.append(food)
-
-                    add_food_to_nutrition(food)
-
-                    # Scale nutrients
-                    for nutrient in state.BASE:
-                        state.BASE[nutrient] *= relative_mass
-                    print("loading dialog object:", loading_dialog)
-
-                except Exception as ex:
-                    print(ex)
-                finally:
-                    page.run_thread(finish_loading)
-            
-                def finish_loading():
-                    hide_loading()
-                    refresh_nutrition()
-                    refresh_log()
-                    page.update()
-            threading.Thread(target=worker, daemon=True).start()
 
         serving_dialog.title = ft.Text(food)
 
