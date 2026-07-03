@@ -779,6 +779,9 @@ def main(page: ft.Page):
     
 
         def confirm(e):
+            serving_dialog.open = False
+            #loading_dialog.open = False
+            page.update()
             show_loading("Adding food to log...")
             def worker():
                 try:
@@ -793,14 +796,17 @@ def main(page: ft.Page):
                     # Scale nutrients
                     for nutrient in state.BASE:
                         state.BASE[nutrient] *= relative_mass
+                    print("loading dialog object:", loading_dialog)
 
-                    refresh_log()
-                    refresh_nutrition()
                 except Exception as ex:
                     print(ex)
                 finally:
-                    page.run_thread(hide_loading)
+                    page.run_thread(finish_loading)
+            
+                def finish_loading():
                     hide_loading()
+                    refresh_nutrition()
+                    refresh_log()
                     page.update()
             threading.Thread(target=worker, daemon=True).start()
 
