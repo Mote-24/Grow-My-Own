@@ -12,6 +12,8 @@ Set your Anthropic API key:
     export ANTHROPIC_API_KEY="sk-ant-..."
 """
 
+import time
+
 import flet as ft
 import threading
 import os
@@ -840,33 +842,23 @@ def main(page: ft.Page):
             return
 
         file = result[0]
-        refresh_log()
+        
+        import time
 
-        show_loading("Analyzing your photo...This may take a minute.")
-        page.update()
-
-
-        def worker():
-            try:
-                #target = ai_food_checker(file.path)
-                #food_log.append(target)
-                #add_food_to_nutrition(target)
-
-                target = ai_food_checker(file.path)
-                detected_food["value"] = target
-                page.run_thread(show_confirmation_dialog)
-            except Exception as ex:
-                print(ex)
-            finally:
-                page.run_thread(finish_loading)
-            
-        def finish_loading():
-            hide_loading()
-            refresh_nutrition()
-            refresh_log()
+        def start_task():
+            show_loading("Analyzing your photo...This may take a minute.")
+            time.sleep(60)
             page.update()
         
-        threading.Thread(target=worker, daemon=True).start()
+        def one_minute_passed():
+            target = ai_food_checker(file.path)
+            detected_food["value"] = target
+            page.run_thread(show_confirmation_dialog)
+
+        task1 = threading.Thread(target=start_task)
+        task1.start()
+        task2 = threading.Thread(target=one_minute_passed)
+        task2.start()
 
 
     # ── Shared refs ──────────────────────────
@@ -1752,29 +1744,65 @@ def main(page: ft.Page):
                     state.BASE["vit_e"] += amount
 
 
-    def add_food(e):
+    # async def add_food(e):
+    #     food = food_autocomplete_ref.current.value.strip()
+        
+    #     if not food:
+    #         return
+        
+    #     show_loading("Finding serving sizes...")
+        
+    #     try:
+    #             import asyncio
+    #             options = await asyncio.to_thread(get_serving_options, food)
 
+    #             options = get_serving_options(food)
+    #             print("OPTIONS:", options)
+
+    #             page.run_thread(lambda: show_serving_dialog(food, options))
+
+    #             print(show_serving_dialog(food, options))
+
+    #     except Exception as ex:
+    #             print(ex)
+            
+    #     threading.Thread(target=worker, daemon=True).start()
+
+    async def add_food(e):
         food = food_autocomplete_ref.current.value.strip()
-
-        if not food:
+        if not food: 
             return
-
+        
         show_loading("Finding serving sizes...")
+        page.update()
+
+        def finish_loading():
+            hide_loading()
+            #refresh_nutrition()
+            #refresh_log()
+            page.update()
 
         def worker():
             try:
+                # 1. Fetch options on the background thread
                 options = get_serving_options(food)
-
                 print("OPTIONS:", options)
-
+                
+                # 2. Show the dialog UI via run_thread
                 page.run_thread(lambda: show_serving_dialog(food, options))
 
-                page.run_thread(hide_loading)
-                hide_loading()
             except Exception as ex:
                 print(ex)
+                #page.run_thread(finish_loading)
 
+            finally:
+                # 3. Always hide the loading screen and refresh when finished
+                print("reached finally")
+                page.run_thread(finish_loading)
+
+            
         threading.Thread(target=worker, daemon=True).start()
+
     tab_bar = ft.Container(
         content=ft.Row([
             ft.TextButton("Garden",    ref=tab_garden_btn,
