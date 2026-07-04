@@ -90,7 +90,7 @@ def returnEfficiency(goalRatio, foodRatio):
     normFactor  = 100 / foodRatio[1]
     foodNormed  = round(foodRatio[0] * normFactor, 4)
     goalNormed  = goalRatio[0] * (100 / goalRatio[1])
-    return foodNormed / goalNormed if goalNormed != 0 else 0
+    return min(foodNormed / goalNormed, 1.0) if goalNormed != 0 else 0
 
 def scoreNutrientList(foodRatios, goalRatio):
     """Run returnEfficiency across a list of foods for one nutrient."""
