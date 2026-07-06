@@ -762,9 +762,7 @@ def main(page: ft.Page):
     page.overlay.append(serving_dialog)
 
     def show_serving_dialog(food, options):
-
         hide_loading()
-
 
         serving_dropdown.options = [
             ft.dropdown.Option(
@@ -778,48 +776,71 @@ def main(page: ft.Page):
             print("No serving options returned!")
             return
 
-        serving_dropdown.value = str(options[0]["grams"])    
-    
+        serving_dropdown.value = str(options[0]["grams"])
 
-        def confirm(e):
-
+        async def confirm(e):
             grams = float(serving_dropdown.value)
-
             relative_mass = grams / 100
 
-            food_log.append(food)
-
-            add_food_to_nutrition(food)
-
-            # Scale nutrients
-            for nutrient in state.BASE:
-                state.BASE[nutrient] *= relative_mass
-
-            refresh_log()
-            refresh_nutrition()
-
+            # close the serving dialog, show the second loader
             serving_dialog.open = False
 
+            determinate_ring = ft.ProgressRing(
+                width=16, height=16, stroke_width=2, value=0
+            )
+            determinate_message = ft.Text("Wait for the completion...")
+            loader_area = ft.SafeArea(
+                content=ft.Column(
+                    controls=[
+                        ft.Row(controls=[determinate_ring, determinate_message]),
+                    ]
+                )
+            )
+            page.add(loader_area)
             page.update()
 
-        serving_dialog.title = ft.Text(food)
+            def do_the_work():
+                food_log.append(food)
+                add_food_to_nutrition(food)
+                for nutrient in state.BASE:
+                    state.BASE[nutrient] *= relative_mass
+                refresh_log()
+                refresh_nutrition()
 
+            async def loader():
+                for i in range(2):
+                    determinate_ring.value = None
+                    page.update()
+                    await asyncio.sleep(1.0)
+                # remove the loader entirely instead of just hiding it
+                determinate_ring.visible = False
+                determinate_message.visible = False
+                page.update()
+            
+            async def worker():
+                # runs the blocking work off the event loop
+                await asyncio.to_thread(do_the_work)
+                page.run_thread(lambda: (refresh_log(), refresh_nutrition()))
+
+            task1 = asyncio.create_task(loader())
+            task2 = asyncio.create_task(worker())
+            await asyncio.gather(task1, task2)
+
+        # ── dialog setup runs NOW, not on click ──
+        serving_dialog.title = ft.Text(food)
         serving_dialog.content = ft.Column(
             [
                 ft.Text("Choose the closest serving size:"),
-
                 serving_dropdown,
             ],
             tight=True,
         )
-
         serving_dialog.actions = [
             ft.ElevatedButton("Confirm", on_click=confirm)
         ]
-
         serving_dialog.open = True
-
         page.update()
+
 
     def show_loading(message="Loading..."):
         loading_text.value = message
@@ -1749,31 +1770,6 @@ def main(page: ft.Page):
                 elif nutrient == "323":
                     state.BASE["vit_e"] += amount
 
-
-    # async def add_food(e):
-    #     food = food_autocomplete_ref.current.value.strip()
-        
-    #     if not food:
-    #         return
-        
-    #     show_loading("Finding serving sizes...")
-        
-    #     try:
-    #             import asyncio
-    #             options = await asyncio.to_thread(get_serving_options, food)
-
-    #             options = get_serving_options(food)
-    #             print("OPTIONS:", options)
-
-    #             page.run_thread(lambda: show_serving_dialog(food, options))
-
-    #             print(show_serving_dialog(food, options))
-
-    #     except Exception as ex:
-    #             print(ex)
-            
-    #     threading.Thread(target=worker, daemon=True).start()
-
     async def add_food():
         food = food_autocomplete_ref.current.value.strip()
         if not food: 
@@ -1802,10 +1798,10 @@ def main(page: ft.Page):
 
         async def update_progress():
             # Fill the ring over ~10 seconds
-            for i in range(101):
-                determinate_ring.value = i / 100
-                page.update()
-                await asyncio.sleep(0.1)  # 101 * 0.1s ≈ 10 seconds
+            #for i in range(2):
+            determinate_ring.value = None
+            page.update()
+            await asyncio.sleep(4.0)
 
             determinate_ring.visible = False
             determinate_message.visible = False
