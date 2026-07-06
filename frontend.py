@@ -777,16 +777,15 @@ def main(page: ft.Page):
             return
 
         serving_dropdown.value = str(options[0]["grams"])
-
+        
         async def confirm(e):
             grams = float(serving_dropdown.value)
             relative_mass = grams / 100
 
-            # close the serving dialog, show the second loader
             serving_dialog.open = False
 
             determinate_ring = ft.ProgressRing(
-                width=16, height=16, stroke_width=2, value=0
+                width=16, height=16, stroke_width=2, value=None
             )
             determinate_message = ft.Text("Wait for the completion...")
             loader_area = ft.SafeArea(
@@ -799,32 +798,31 @@ def main(page: ft.Page):
             page.add(loader_area)
             page.update()
 
+            done = {"flag": False}
+
             def do_the_work():
                 food_log.append(food)
                 add_food_to_nutrition(food)
                 for nutrient in state.BASE:
                     state.BASE[nutrient] *= relative_mass
-                refresh_log()
-                refresh_nutrition()
 
             async def loader():
-                for i in range(2):
-                    determinate_ring.value = None
+                while not done["flag"]:
                     page.update()
-                    await asyncio.sleep(1.0)
-                # remove the loader entirely instead of just hiding it
+                    await asyncio.sleep(0.1)
                 determinate_ring.visible = False
                 determinate_message.visible = False
                 page.update()
-            
+
             async def worker():
-                # runs the blocking work off the event loop
                 await asyncio.to_thread(do_the_work)
+                done["flag"] = True
                 page.run_thread(lambda: (refresh_log(), refresh_nutrition()))
 
             task1 = asyncio.create_task(loader())
             task2 = asyncio.create_task(worker())
             await asyncio.gather(task1, task2)
+
 
         # ── dialog setup runs NOW, not on click ──
         serving_dialog.title = ft.Text(food)
@@ -855,33 +853,54 @@ def main(page: ft.Page):
     
     # This must be an async function to capture the new file picker returns
     
-
     async def upload_food_photo(e):
         result = await pick_files_dialog.pick_files(
             allow_multiple=False,
             allowed_extensions=["jpg", "jpeg", "png"],
-         )
+        )
 
         if not result:
-             return
-        
-      
-        show_loading("Analyzing your photo...This may take a minute.")
+            return
 
         file = result[0]
         detected_food["value"] = ""
 
-        def process_ai_analysis():
-            try:
-                target = ai_food_checker(file.path)
-                detected_food["value"] = target
-                # show_confirmation_dialog() hides the loader and opens confirm
-                page.run_thread(show_confirmation_dialog)
-            except Exception as err:
-                print(f"AI Error: {err}")
-                page.run_thread(hide_loading)
+        determinate_ring = ft.ProgressRing(
+            width=16, height=16, stroke_width=2, value=None  # None = indeterminate spinner
+        )
+        determinate_message = ft.Text("Analyzing your photo... this may take a minute.")
+        loader_area = ft.SafeArea(
+            content=ft.Column(
+                controls=[
+                    ft.Row(controls=[determinate_ring, determinate_message]),
+                ]
+            )
+        )
+        page.add(loader_area)
+        page.update()
 
-        threading.Thread(target=process_ai_analysis, daemon=True).start()
+        # shared flag so the spinner knows when to stop
+        done = {"flag": False}
+
+        async def update_progress():
+            # keep the ring spinning until the worker signals completion
+            while not done["flag"]:
+                page.update()
+                await asyncio.sleep(0.1)
+            determinate_ring.visible = False
+            determinate_message.visible = False
+            page.update()
+
+        async def process_ai_analysis():
+            # heavy work off the event loop, exactly like worker() in add_food
+            target = await asyncio.to_thread(ai_food_checker, file.path)
+            detected_food["value"] = target
+            done["flag"] = True
+            page.run_thread(show_confirmation_dialog)
+
+        task1 = asyncio.create_task(update_progress())
+        task2 = asyncio.create_task(process_ai_analysis())
+        await asyncio.gather(task1, task2)
 
 
     # ── Shared refs ──────────────────────────
@@ -912,21 +931,49 @@ def main(page: ft.Page):
         content=confirm_text,
     )
     page.overlay.append(confirm_dialog)
-
-    def confirm_yes(e):
+    async def confirm_yes(e):
         food = detected_food["value"]
 
-        food_log.append(food)
-        add_food_to_nutrition(food)
-
-        refresh_log()
-        refresh_nutrition()
-
+        # close the confirmation dialog first
         confirm_dialog.open = False
-
-        hide_loading()
-        loading_dialog.open = False
         page.update()
+
+        determinate_ring = ft.ProgressRing(
+            width=16, height=16, stroke_width=2, value=None  # indeterminate spinner
+        )
+        determinate_message = ft.Text("Adding to your log...")
+        loader_area = ft.SafeArea(
+            content=ft.Column(
+                controls=[
+                    ft.Row(controls=[determinate_ring, determinate_message]),
+                ]
+            )
+        )
+        page.add(loader_area)
+        page.update()
+
+        done = {"flag": False}
+
+        async def update_progress():
+            while not done["flag"]:
+                page.update()
+                await asyncio.sleep(0.1)
+            determinate_ring.visible = False
+            determinate_message.visible = False
+            page.update()
+
+        def do_the_work():
+            food_log.append(food)
+            add_food_to_nutrition(food)
+
+        async def worker():
+            await asyncio.to_thread(do_the_work)
+            done["flag"] = True
+            page.run_thread(lambda: (refresh_log(), refresh_nutrition()))
+
+        task1 = asyncio.create_task(update_progress())
+        task2 = asyncio.create_task(worker())
+        await asyncio.gather(task1, task2)
     
     def confirm_no(e):
         confirm_dialog.open = False
@@ -1770,51 +1817,91 @@ def main(page: ft.Page):
                 elif nutrient == "323":
                     state.BASE["vit_e"] += amount
 
+
     async def add_food():
         food = food_autocomplete_ref.current.value.strip()
-        if not food: 
+        if not food:
             return
-        
 
         determinate_ring = ft.ProgressRing(
-        width=16, height=16, stroke_width=2, value=0
-    )
-        determinate_message = ft.Text("Wait for the completion...")
-
-        page.add(
-            ft.SafeArea(
-                content=ft.Column(
-                    controls=[
-                        ft.Row(
-                            controls=[
-                                determinate_ring,
-                                determinate_message,
-                            ],
-                        ),
-                    ]
-                )
+            width=16, height=16, stroke_width=2, value=None  # indeterminate spinner
+        )
+        determinate_message = ft.Text("Finding serving sizes...")
+        loader_area = ft.SafeArea(
+            content=ft.Column(
+                controls=[
+                    ft.Row(controls=[determinate_ring, determinate_message]),
+                ]
             )
         )
+        page.add(loader_area)
+        page.update()
+
+        done = {"flag": False}
 
         async def update_progress():
-            # Fill the ring over ~10 seconds
-            #for i in range(2):
-            determinate_ring.value = None
-            page.update()
-            await asyncio.sleep(4.0)
-
+            while not done["flag"]:
+                page.update()
+                await asyncio.sleep(0.1)
             determinate_ring.visible = False
             determinate_message.visible = False
             page.update()
 
         async def worker():
-                options = await asyncio.to_thread(get_serving_options, food)
-                print("OPTIONS:", options)
-                page.run_thread(lambda: show_serving_dialog(food, options))
+            options = await asyncio.to_thread(get_serving_options, food)
+            print("OPTIONS:", options)
+            done["flag"] = True
+            page.run_thread(lambda: show_serving_dialog(food, options))
 
         task1 = asyncio.create_task(update_progress())
         task2 = asyncio.create_task(worker())
         await asyncio.gather(task1, task2)
+
+    # async def add_food():
+    #     food = food_autocomplete_ref.current.value.strip()
+    #     if not food: 
+    #         return
+        
+
+    #     determinate_ring = ft.ProgressRing(
+    #     width=16, height=16, stroke_width=2, value=0
+    # )
+    #     determinate_message = ft.Text("Wait for the completion...")
+
+    #     page.add(
+    #         ft.SafeArea(
+    #             content=ft.Column(
+    #                 controls=[
+    #                     ft.Row(
+    #                         controls=[
+    #                             determinate_ring,
+    #                             determinate_message,
+    #                         ],
+    #                     ),
+    #                 ]
+    #             )
+    #         )
+    #     )
+
+    #     async def update_progress():
+    #         # Fill the ring over ~10 seconds
+    #         #for i in range(2):
+    #         determinate_ring.value = None
+    #         page.update()
+    #         await asyncio.sleep(4.0)
+
+    #         determinate_ring.visible = False
+    #         determinate_message.visible = False
+    #         page.update()
+
+    #     async def worker():
+    #             options = await asyncio.to_thread(get_serving_options, food)
+    #             print("OPTIONS:", options)
+    #             page.run_thread(lambda: show_serving_dialog(food, options))
+
+    #     task1 = asyncio.create_task(update_progress())
+    #     task2 = asyncio.create_task(worker())
+    #     await asyncio.gather(task1, task2)
 
     tab_bar = ft.Container(
         content=ft.Row([
