@@ -12,6 +12,7 @@ Set your Anthropic API key:
     export ANTHROPIC_API_KEY="sk-ant-..."
 """
 
+import asyncio
 import time
 
 import flet as ft
@@ -823,10 +824,12 @@ def main(page: ft.Page):
     def show_loading(message="Loading..."):
         loading_text.value = message
         loading_dialog.open = True
+        print("show loading")
         page.update()
 
     def hide_loading():
         loading_dialog.open = False
+        print("hide loading")
         page.update()
     
     # This must be an async function to capture the new file picker returns
@@ -836,29 +839,28 @@ def main(page: ft.Page):
         result = await pick_files_dialog.pick_files(
             allow_multiple=False,
             allowed_extensions=["jpg", "jpeg", "png"],
-        )
+         )
 
         if not result:
-            return
+             return
+        
+      
+        show_loading("Analyzing your photo...This may take a minute.")
 
         file = result[0]
-        
-        import time
+        detected_food["value"] = ""
 
-        def start_task():
-            show_loading("Analyzing your photo...This may take a minute.")
-            time.sleep(60)
-            page.update()
-        
-        def one_minute_passed():
-            target = ai_food_checker(file.path)
-            detected_food["value"] = target
-            page.run_thread(show_confirmation_dialog)
+        def process_ai_analysis():
+            try:
+                target = ai_food_checker(file.path)
+                detected_food["value"] = target
+                # show_confirmation_dialog() hides the loader and opens confirm
+                page.run_thread(show_confirmation_dialog)
+            except Exception as err:
+                print(f"AI Error: {err}")
+                page.run_thread(hide_loading)
 
-        task1 = threading.Thread(target=start_task)
-        task1.start()
-        task2 = threading.Thread(target=one_minute_passed)
-        task2.start()
+        threading.Thread(target=process_ai_analysis, daemon=True).start()
 
 
     # ── Shared refs ──────────────────────────
@@ -900,6 +902,9 @@ def main(page: ft.Page):
         refresh_nutrition()
 
         confirm_dialog.open = False
+
+        hide_loading()
+        loading_dialog.open = False
         page.update()
     
     def confirm_no(e):
@@ -912,6 +917,7 @@ def main(page: ft.Page):
 
     def show_confirmation_dialog():
         hide_loading()
+        loading_dialog.open = False
 
         confirm_text.value = f"We detected:\n\n{detected_food['value']}"
 
@@ -1768,40 +1774,51 @@ def main(page: ft.Page):
             
     #     threading.Thread(target=worker, daemon=True).start()
 
-    async def add_food(e):
+    async def add_food():
         food = food_autocomplete_ref.current.value.strip()
         if not food: 
             return
         
-        show_loading("Finding serving sizes...")
-        page.update()
 
-        def finish_loading():
-            hide_loading()
-            #refresh_nutrition()
-            #refresh_log()
+        determinate_ring = ft.ProgressRing(
+        width=16, height=16, stroke_width=2, value=0
+    )
+        determinate_message = ft.Text("Wait for the completion...")
+
+        page.add(
+            ft.SafeArea(
+                content=ft.Column(
+                    controls=[
+                        ft.Row(
+                            controls=[
+                                determinate_ring,
+                                determinate_message,
+                            ],
+                        ),
+                    ]
+                )
+            )
+        )
+
+        async def update_progress():
+            # Fill the ring over ~10 seconds
+            for i in range(101):
+                determinate_ring.value = i / 100
+                page.update()
+                await asyncio.sleep(0.1)  # 101 * 0.1s ≈ 10 seconds
+
+            determinate_ring.visible = False
+            determinate_message.visible = False
             page.update()
 
-        def worker():
-            try:
-                # 1. Fetch options on the background thread
-                options = get_serving_options(food)
+        async def worker():
+                options = await asyncio.to_thread(get_serving_options, food)
                 print("OPTIONS:", options)
-                
-                # 2. Show the dialog UI via run_thread
                 page.run_thread(lambda: show_serving_dialog(food, options))
 
-            except Exception as ex:
-                print(ex)
-                #page.run_thread(finish_loading)
-
-            finally:
-                # 3. Always hide the loading screen and refresh when finished
-                print("reached finally")
-                page.run_thread(finish_loading)
-
-            
-        threading.Thread(target=worker, daemon=True).start()
+        task1 = asyncio.create_task(update_progress())
+        task2 = asyncio.create_task(worker())
+        await asyncio.gather(task1, task2)
 
     tab_bar = ft.Container(
         content=ft.Row([
